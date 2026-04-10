@@ -22,7 +22,7 @@ export default function LoginPage() {
     });
 
     if (res.ok) {
-      router.push("/dashboard");
+      router.push("/");
     } else {
       setError("Invalid password");
       setLoading(false);
@@ -36,7 +36,7 @@ export default function LoginPage() {
           <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-accent/10">
             <Leaf className="h-7 w-7 text-accent" />
           </div>
-          <h1 className="text-xl font-semibold">Evergreen Vault</h1>
+          <h1 className="text-xl font-semibold">Evergreen Command</h1>
           <p className="text-sm text-text-muted">
             Enter your password to continue
           </p>
@@ -59,7 +59,7 @@ export default function LoginPage() {
             disabled={loading}
             className="w-full rounded-xl bg-accent py-3 text-sm font-medium text-black hover:bg-accent-dim transition-colors disabled:opacity-50"
           >
-            {loading ? "Authenticating..." : "Unlock Vault"}
+            {loading ? "Authenticating..." : "Unlock"}
           </button>
         </form>
       </div>
