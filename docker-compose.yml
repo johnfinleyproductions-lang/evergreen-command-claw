@@ -1,28 +1,25 @@
-version: "3.8"
-
 services:
   postgres:
     image: pgvector/pgvector:pg17
-    container_name: evergreen-vault-db
+    container_name: evergreen-command-db
     restart: unless-stopped
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_USER: vault
-      POSTGRES_PASSWORD: vault_secret
-      POSTGRES_DB: evergreen_vault
+      POSTGRES_USER: command
+      POSTGRES_PASSWORD: command_secret
+      POSTGRES_DB: evergreen_command
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./drizzle/init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U vault -d evergreen_vault"]
+      test: ["CMD-SHELL", "pg_isready -U command -d evergreen_command"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   minio:
     image: minio/minio:latest
-    container_name: evergreen-vault-minio
+    container_name: evergreen-command-minio
     restart: unless-stopped
     ports:
       - "9000:9000"
