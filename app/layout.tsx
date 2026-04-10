@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Evergreen Vault",
-  description: "Centralized knowledge base and resource vault",
+  title: "Evergreen Command",
+  description: "Local AI task runner on the Framestation",
 };
 
 export default function RootLayout({
