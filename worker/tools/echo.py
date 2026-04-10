@@ -1,4 +1,4 @@
-"""Stub tool for Phase 3A — proves the end-to-end plumbing works.
+"""Stub tool for Phase 3A regression tests.
 
 Takes {message: str} and returns {echo, length, reversed}.
 No external APIs, no side effects, no failure modes (except bad input).

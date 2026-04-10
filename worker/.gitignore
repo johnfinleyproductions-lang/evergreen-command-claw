@@ -20,3 +20,6 @@ env/
 
 # logs
 *.log
+
+# runtime artifacts (briefs, reports, etc — references are in the DB)
+artifacts/

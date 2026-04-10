@@ -3,9 +3,10 @@
 Responsibilities:
 - Pool lifecycle (open/close) with JSONB type codec
 - claim_next_run: atomic FOR UPDATE SKIP LOCKED fetch + flip to 'running'
-- insert_tool_call / update_tool_call: tool execution records
-- log: append a row to the `logs` table
-- finalize_run: mark run 'succeeded' or 'failed' with output + timing
+- insert_tool_call / complete_tool_call / fail_tool_call: tool execution rows
+- insert_artifact: artifact rows (briefs, reports, etc)
+- write_log: append a structured row to the `logs` table
+- finalize_run_success / finalize_run_failure: run status transitions
 """
 from __future__ import annotations
 
@@ -54,6 +55,9 @@ async def close_pool() -> None:
         _pool = None
 
 
+# --- runs --------------------------------------------------------------------
+
+
 async def claim_next_run() -> Optional[asyncpg.Record]:
     """Atomically claim one pending run and flip to 'running'.
 
@@ -84,6 +88,56 @@ async def claim_next_run() -> Optional[asyncpg.Record]:
                 row["id"],
             )
             return row
+
+
+async def finalize_run_success(
+    run_id: UUID,
+    output: dict,
+    *,
+    model: Optional[str] = None,
+    prompt_tokens: Optional[int] = None,
+    completion_tokens: Optional[int] = None,
+    total_tokens: Optional[int] = None,
+) -> None:
+    """Mark a run 'succeeded' and optionally record token usage + model."""
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE runs
+            SET status = 'succeeded',
+                output = $2,
+                finished_at = now(),
+                model = COALESCE($3, model),
+                prompt_tokens = $4,
+                completion_tokens = $5,
+                total_tokens = $6
+            WHERE id = $1
+            """,
+            run_id,
+            output,
+            model,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        )
+
+
+async def finalize_run_failure(run_id: UUID, error_message: str) -> None:
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE runs
+            SET status = 'failed', error_message = $2, finished_at = now()
+            WHERE id = $1
+            """,
+            run_id,
+            error_message,
+        )
+
+
+# --- tool calls --------------------------------------------------------------
 
 
 async def insert_tool_call(
@@ -148,6 +202,42 @@ async def fail_tool_call(
         )
 
 
+# --- artifacts ---------------------------------------------------------------
+
+
+async def insert_artifact(
+    run_id: UUID,
+    *,
+    name: str,
+    path: str,
+    kind: str = "other",
+    mime_type: Optional[str] = None,
+    size: Optional[int] = None,
+    metadata: Optional[dict] = None,
+) -> UUID:
+    """Insert an artifact row. `kind` must be report|data|image|code|log|other."""
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO artifacts (run_id, name, path, kind, mime_type, size, metadata)
+            VALUES ($1, $2, $3, $4::artifact_kind, $5, $6, $7)
+            RETURNING id
+            """,
+            run_id,
+            name,
+            path,
+            kind,
+            mime_type,
+            size,
+            metadata,
+        )
+        return row["id"]
+
+
+# --- logs --------------------------------------------------------------------
+
+
 async def write_log(
     run_id: UUID,
     level: str,
@@ -166,32 +256,4 @@ async def write_log(
             level,
             message,
             data,
-        )
-
-
-async def finalize_run_success(run_id: UUID, output: dict) -> None:
-    assert _pool is not None
-    async with _pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE runs
-            SET status = 'succeeded', output = $2, finished_at = now()
-            WHERE id = $1
-            """,
-            run_id,
-            output,
-        )
-
-
-async def finalize_run_failure(run_id: UUID, error_message: str) -> None:
-    assert _pool is not None
-    async with _pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE runs
-            SET status = 'failed', error_message = $2, finished_at = now()
-            WHERE id = $1
-            """,
-            run_id,
-            error_message,
         )

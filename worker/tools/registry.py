@@ -2,6 +2,9 @@
 
 Sync tools are offloaded to a thread via asyncio.to_thread so they don't
 block the event loop. Async tools are awaited directly.
+
+asyncio.to_thread propagates contextvars automatically (Python 3.9+) via
+copy_context, so sync tools can still read current_run_id if they need it.
 """
 import asyncio
 import inspect
