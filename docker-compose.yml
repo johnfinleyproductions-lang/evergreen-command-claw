@@ -3,8 +3,14 @@ services:
     image: pgvector/pgvector:pg17
     container_name: evergreen-command-db
     restart: unless-stopped
+    # NOTE: host port 5433 (not 5432) because evergreen-vault-db from
+    # another project owns 5432. See README Lessons Learned — if you
+    # publish to a port that's already bound, docker compose silently
+    # starts the container WITHOUT the port mapping, leaving it
+    # unreachable over TCP while appearing healthy. Always `ss -tlnp`
+    # before binding.
     ports:
-      - "5432:5432"
+      - "5433:5432"
     environment:
       POSTGRES_USER: command
       POSTGRES_PASSWORD: command_secret
