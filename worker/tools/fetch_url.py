@@ -3,6 +3,13 @@
 Async tool (uses httpx.AsyncClient directly, no thread offload). Strips
 HTML via BeautifulSoup and truncates very long pages so the model doesn't
 get drowned in a 500 KB wall of nav/footer cruft.
+
+Note on MAX_CONTENT_LENGTH: this is deliberately aggressive. Every fetched
+page lands in the agent's message history as a `tool` message, and the
+history grows with every iteration. At 6000 chars (~1500 tokens) a page,
+the agent can chain 5+ fetches inside even a modest 8K context window.
+Raising this number is tempting but has burned us before -- two 50KB
+fetches blew through an 8192-token context on the tier 2 smoke test.
 """
 from typing import Any
 
@@ -11,7 +18,7 @@ from bs4 import BeautifulSoup
 
 from .base import Tool
 
-MAX_CONTENT_LENGTH = 50_000
+MAX_CONTENT_LENGTH = 6_000
 USER_AGENT = "EvergreenCommand/0.1 (+local research agent)"
 
 
@@ -20,8 +27,9 @@ class FetchUrlTool(Tool):
     description = (
         "Fetch a URL and return its readable text content. HTML is stripped "
         "down to body text (scripts, styles, nav, footer removed). Long pages "
-        "are truncated. Use this after web_search to read the actual content "
-        "of a promising result."
+        "are truncated to about 6000 characters -- enough for a summary, not "
+        "enough to blow the context window. Use this after web_search to read "
+        "the actual content of a promising result."
     )
     parameters = {
         "type": "object",

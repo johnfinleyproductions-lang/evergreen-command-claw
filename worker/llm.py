@@ -2,6 +2,11 @@
 
 Thin wrapper around httpx.AsyncClient. No Vercel AI SDK, no magic. Talks
 directly to /v1/chat/completions on llama-server (port 8081 by default).
+
+On non-2xx responses we manually build the HTTPStatusError with a snippet
+of the response body in the message, because llama-server's errors are
+informative (e.g. "context window exceeded") but httpx.raise_for_status()
+by default only surfaces the status code.
 """
 from __future__ import annotations
 
@@ -61,11 +66,17 @@ class LLMClient:
             f"{self.base_url}/v1/chat/completions",
             json=payload,
         )
-        r.raise_for_status()
+        if r.status_code >= 400:
+            body_preview = (r.text or "")[:800]
+            raise httpx.HTTPStatusError(
+                f"{r.status_code} from llama-server: {body_preview}",
+                request=r.request,
+                response=r,
+            )
         return r.json()
 
     async def models(self) -> dict:
-        """GET /v1/models — smoke test that the server is reachable."""
+        """GET /v1/models \u2014 smoke test that the server is reachable."""
         if self._client is None:
             raise RuntimeError("LLMClient not opened (use 'async with')")
         r = await self._client.get(f"{self.base_url}/v1/models")

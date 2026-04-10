@@ -1,4 +1,4 @@
-"""Agent loop — Phase 3B.
+"""Agent loop \u2014 Phase 3B.
 
 Given a prompt, builds a messages list, asks the LLM to plan + call tools,
 dispatches the tool calls through the registry, feeds the results back, and
@@ -26,14 +26,31 @@ log = logging.getLogger(__name__)
 
 DEFAULT_SYSTEM_PROMPT = """You are Evergreen Command, a local AI task runner running on a private GPU server.
 
-You have access to a set of tools provided to you via the function-calling interface. Use them to gather real information and produce real deliverables. Never fabricate tool results — always call the tool.
+You have access to a set of tools provided to you via the function-calling interface. Use them to gather real information and produce real deliverables. Never fabricate tool results \u2014 always call the tool.
 
 Guidelines:
 - For research tasks, use `web_search` to find relevant pages, then `fetch_url` to read the ones that look promising.
 - For written deliverables (briefs, reports, summaries), use `write_brief` to save the final document to disk as an artifact.
-- Be efficient: don't call tools you don't need. 3–6 tool calls is usually enough for a research brief.
+- Be efficient: don't call tools you don't need. 3\u20136 tool calls is usually enough for a research brief.
+- Keep your running context lean: you have a limited context window. Don't re-fetch pages you've already read, and don't run duplicate searches.
 - When the task is complete, reply with a short plain-text summary of what you did and where to find any artifacts you saved. Do NOT call any tool in your final message.
 """
+
+
+def _estimate_context_size(messages: list[dict]) -> tuple[int, int]:
+    """Return (chars, rough_token_estimate) for the current message history.
+
+    Very rough: we JSON-serialize each message and divide chars by 4 for a
+    crude token count. Good enough to watch the number grow across iterations
+    and diagnose context-window overflows.
+    """
+    total_chars = 0
+    for m in messages:
+        try:
+            total_chars += len(json.dumps(m, default=str))
+        except Exception:  # noqa: BLE001
+            total_chars += len(str(m))
+    return total_chars, total_chars // 4
 
 
 async def run_agent(
@@ -78,11 +95,17 @@ async def run_agent(
 
     async with make_client() as llm:
         for iteration in range(config.AGENT_MAX_ITERATIONS):
+            ctx_chars, ctx_tokens_est = _estimate_context_size(messages)
             await write_log(
                 run_id,
                 "info",
-                f"agent iteration {iteration + 1}",
-                {"iteration": iteration + 1},
+                f"agent iteration {iteration + 1} (context ~{ctx_tokens_est} tokens, {len(messages)} msgs)",
+                {
+                    "iteration": iteration + 1,
+                    "message_count": len(messages),
+                    "context_chars": ctx_chars,
+                    "context_tokens_estimate": ctx_tokens_est,
+                },
             )
 
             try:
@@ -90,7 +113,7 @@ async def run_agent(
             except Exception as exc:
                 err = f"LLM call failed: {type(exc).__name__}: {exc}"
                 log.exception("llm.chat failed")
-                await write_log(run_id, "error", err)
+                await write_log(run_id, "error", err, {"iteration": iteration + 1})
                 raise
 
             # --- token accounting ---
@@ -130,7 +153,7 @@ async def run_agent(
             messages.append(assistant_append)
 
             if not tool_calls:
-                # Final answer — we're done
+                # Final answer \u2014 we're done
                 final_answer = content
                 await write_log(
                     run_id,
@@ -214,7 +237,7 @@ async def run_agent(
 
                 sequence += 1
         else:
-            # Loop fell through without break — hit max iterations
+            # Loop fell through without break \u2014 hit max iterations
             hit_max = True
             await write_log(
                 run_id,
