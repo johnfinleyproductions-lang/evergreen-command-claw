@@ -146,7 +146,7 @@ middleware.ts                Cookie gate: unauthenticated → /login (except /lo
 
 ```
 drizzle.config.ts            Points at ./lib/db/schema/index.ts, out: ./drizzle
-docker-compose.yml           Postgres (:5432) + MinIO (:9010 S3, :9011 console)
+docker-compose.yml           Postgres (host :5433 → container :5432) + MinIO (:9010 S3, :9011 console)
 next.config.ts               Next.js config (mostly defaults)
 tsconfig.json                Root TS config — include glob is **/*.ts **/*.tsx
 postcss.config.mjs           Tailwind v4 PostCSS plugin
@@ -186,30 +186,34 @@ npm install
 ```bash
 cp .env.example .env.local
 # Edit .env.local to set AUTH_SECRET, AUTH_PASSWORD, COMMAND_API_KEY to real values.
-# The Postgres URL default already matches docker-compose.yml.
+# The Postgres URL default already matches docker-compose.yml (host port 5433, not 5432 —
+# see Lessons Learned: "Docker compose silently drops a port mapping if the port is bound").
 ```
 
 ### 4. Start the database (Postgres only for now — MinIO deferred to Phase 4)
 
 ```bash
+# VERIFY host port 5433 is free first. If it isn't, pick another port and
+# update both docker-compose.yml and .env.local to match.
+ss -tlnp | grep 5433
+
 docker compose up -d postgres
 docker compose ps postgres   # wait for "Up (healthy)"
+docker ps --format 'table {{.Names}}\t{{.Ports}}' | grep command-db
+# Must show: 0.0.0.0:5433->5432/tcp — if PORTS is empty, the mapping
+# silently failed to bind. Change the port in docker-compose.yml and retry.
 ```
 
 ### 5. Apply the schema
 
-Because of a known drizzle-kit 0.31.x silent-migrate bug (see Lessons Learned), we apply the SQL directly on a fresh database:
-
 ```bash
+set -a && source .env.local && set +a && npm run db:push
+# Expected: [✓] Pulling schema from database... [✓] Changes applied
+# Or the fallback if drizzle-kit is acting up:
 docker exec -i evergreen-command-db psql -U command -d evergreen_command < drizzle/0000_complete_bucky.sql
+
 docker exec -it evergreen-command-db psql -U command -d evergreen_command -c "\dt"
 # Should list: artifacts, logs, runs, tasks, tool_calls
-```
-
-For subsequent migrations once drizzle-kit is upgraded to 0.32+, use:
-
-```bash
-set -a && source .env.local && set +a && npm run db:migrate
 ```
 
 ### 6. Launch llama-server (if not already running)
@@ -242,7 +246,7 @@ npm run dev
 
 ```bash
 npm run build
-# Should compile in ~2-3 seconds with no errors
+# Should compile in ~1-2 seconds with no errors
 ```
 
 ---
@@ -254,14 +258,14 @@ Current versions as of 2026-04-10 (post Phase 2 cleanup, verified on disk):
 - **Next.js 15.5.15** with Turbopack
 - **App Router** (not Pages Router)
 - **React 19.1** + React DOM 19.1
-- **Drizzle ORM 0.45.2** + **drizzle-kit 0.31.10** ⚠️ *(0.31.x has a silent migrate bug — pin issue in README, upgrade path is 0.32+)*
+- **Drizzle ORM 0.45.2** + **drizzle-kit 0.31.10** — use `db:push` for schema sync (migrate CLI has a silent-error bug in 0.31.x)
 - **postgres.js 3.4.8**
 - **Tailwind CSS v4** + `@tailwindcss/postcss`
 - **Radix UI** (dialog, dropdown, scroll-area, select, separator, slot, tabs, toast, tooltip)
 - **Vercel AI SDK** (`ai` 6.0.116 + `@ai-sdk/openai` 1.3.22) — talks directly to llama.cpp's OpenAI-compatible endpoint
 - **lucide-react 0.511** for icons
 - **middleware.ts** for auth/routing (HMAC cookie gate)
-- **docker-compose.yml** for local Postgres + MinIO
+- **docker-compose.yml** for local Postgres (host :5433) + MinIO (:9010/:9011)
 
 Added for Command:
 
@@ -269,11 +273,7 @@ Added for Command:
 - **Ollama** (already running) for `nomic-embed-text` embeddings and small-model fallback
 - **Python worker** (FastAPI or plain asyncio, TBD) — ports the tool registry from evergreenagent
 
-**Dead dependencies still in package.json** (Phase 2 tech debt, does not block build, will be pruned before Phase 3):
-
-- `@aws-sdk/client-s3`, `@aws-sdk/s3-request-presigner` — vault-era, replaced by MinIO/S3 if needed later
-- `mammoth`, `pdfjs-dist`, `react-dropzone` — vault file-parsing pipeline, Command doesn't parse uploads
-- `@napi-rs/canvas` — vault image processing
+Post-Phase-2, dead vault-era dependencies were pruned: `@aws-sdk/client-s3`, `@aws-sdk/s3-request-presigner`, `mammoth`, `pdfjs-dist`, `react-dropzone`, `@napi-rs/canvas`. Package count dropped to 141 and build time went from 2.4 s → 1.1 s.
 
 ---
 
@@ -469,21 +469,47 @@ Dropping from 28 → 26 GPU layers on this 120 B MoE gave up **zero** generation
 
 **Symptom:** `npm run db:migrate` prints `Using 'postgres' driver for database querying` and then exits to the shell. No applied-migration list, no error message, no traceback. `\dt` shows zero tables afterwards. Running `npx drizzle-kit migrate; echo $?` reveals `exit code: 1` — so it **is** failing, it's just swallowing the error.
 
-**Versions affected:** Confirmed on `drizzle-kit 0.31.10` + `drizzle-orm 0.45.2` + `postgres 3.4.8` against a fresh Postgres 17.9 instance. Known bug in the 0.31.x line, fixed in 0.32+.
+**Why (discovered during Phase 2 debugging):** drizzle-kit's `migrate` and `push` commands both swallow Postgres connection errors instead of surfacing them. In our case the underlying error was `password authentication failed for user "command"` — but drizzle-kit printed only `Pulling schema from database...` before exiting silently. We only discovered the real error by running raw `postgres.js` from node, which printed the actual Postgres message.
 
-**Workaround (what we do today):** Apply the SQL directly via psql. The generated SQL file is correct; only the migrator CLI is broken:
+**Versions affected:** Confirmed on `drizzle-kit 0.31.10` + `drizzle-orm 0.45.2` + `postgres 3.4.8`. 0.31.10 is the latest published version on npm — no upgrade available as of 2026-04-10.
+
+**Workaround (what we use today):** `drizzle-kit push` works fine **once the underlying connection is actually reachable**. If push is silent, the real problem is a connection issue that drizzle-kit is hiding — always cross-test with a raw postgres.js call before assuming drizzle-kit is broken:
 
 ```bash
-docker exec -i evergreen-command-db psql -U command -d evergreen_command < drizzle/0000_complete_bucky.sql
+node -e "const p=require('postgres');const s=p(process.env.DATABASE_URL);s\`select current_user\`.then(r=>{console.log('OK',r);return s.end()}).catch(e=>{console.error('FAIL',e.message);process.exit(1)})"
 ```
 
-**Followup (not yet done):** Upgrade to drizzle-kit 0.32+, then backfill the `__drizzle_migrations` tracking table with a row for `0000_complete_bucky` so the next `migrate` doesn't try to re-apply the first migration.
+### Docker compose silently drops port mappings if the host port is already bound
 
-**Alternative going forward:** `drizzle-kit push` syncs schema → DB directly without migration files. Simpler for a single-developer project, but loses the audit trail.
+**Symptom:** `docker compose up -d` returned success. `docker ps` showed the container `Up (healthy)`. But `docker ps` also showed an **empty PORTS column** for that container. Meanwhile every TCP connection from the host to the published port was hitting a **different** container on the same port from an unrelated project. The connection succeeded — it was just talking to the wrong database.
+
+**Why:** When you publish host port X with `ports: ["X:Y"]`, Docker first tries to bind a `docker-proxy` process on X. If X is already owned by something else (another container, a native process), the bind fails — but docker compose does **not** abort. It starts the container anyway without the port mapping, logs a success message, and leaves the container running but unreachable over TCP. The container works fine over the internal Docker network, and `docker exec` into it works (that's over a Unix socket, not the published port), which makes the failure invisible unless you specifically check `docker ps --format 'table {{.Names}}\t{{.Ports}}'`.
+
+**Concrete case:** `evergreen-vault-db` from another project had been up 43 hours on host port 5432. When we brought up `evergreen-command-db` with `ports: ["5432:5432"]`, the mapping silently never took effect. Every `node -e` postgres.js test and every `drizzle-kit push` call from the host was connecting to **vault-db**, getting `password authentication failed for user "command"` (because vault-db's role didn't match), and we spent hours editing `pg_hba.conf` on command-db wondering why our changes didn't take effect — because our changes were going to the right container, but our connections were going to the wrong one.
+
+**Fix:**
+1. **Before** committing any port binding in `docker-compose.yml`, run `ss -tlnp | grep <port>` and `docker ps -a | grep -i <service>`. If anything owns the port, pick a different one.
+2. **After** `docker compose up -d`, verify the mapping actually bound: `docker ps --format 'table {{.Names}}\t{{.Ports}}' | grep <container>`. If the PORTS column is empty, the publish silently failed.
+3. Our concrete resolution: moved `evergreen-command-db` from `5432:5432` → `5433:5432` and updated `.env.local`. Both projects now coexist cleanly.
+
+### Docker bridge NAT makes host TCP connections look like they're from the bridge IP, not 127.0.0.1
+
+**Symptom:** `pg_hba.conf` had `host all all 127.0.0.1/32 trust`, but TCP connections from the host to the Docker-published Postgres port were still getting hit by the fallback `scram-sha-256` auth rule. Trust was never applied.
+
+**Why:** When you connect to `127.0.0.1:<published-port>` from the host, the packet goes through Docker's `docker-proxy` + bridge NAT, and by the time it reaches Postgres inside the container, the source address has been rewritten to the Docker bridge IP (e.g. `172.24.0.1`), **not** `127.0.0.1`. Postgres's `pg_hba.conf` `127.0.0.1/32` rule never matches a bridge-NAT'd connection — it falls through to whatever catch-all comes next.
+
+**How to confirm:** Add `inet_client_addr()` to a query and you'll see the bridge IP, not 127.0.0.1:
+
+```sql
+SELECT current_user, inet_client_addr();
+-- → command | 172.24.0.1
+```
+
+**Fix:** If you need trust-level auth for local dev through the Docker bridge, use `host all all 0.0.0.0/0 trust` (dev only, container is only exposed on localhost anyway). The correct rule to cover Docker bridge connections is the IPv4 catch-all, not loopback.
 
 ### Docker port coexistence: always `ss -tlnp` before binding
 
-**Symptom:** `docker compose up -d` failed with `Bind for 0.0.0.0:9000 failed: port is already allocated`. Turned out the old `evergreen-vault-minio` container was still running on `:9000-9001` from a different project, and I'd naively assumed the new compose file could reuse those ports.
+**Symptom:** Early in Phase 2, `docker compose up -d` failed with `Bind for 0.0.0.0:9000 failed: port is already allocated`. (Interestingly, Postgres port bindings failed *silently* instead — see the "silently drops port mappings" lesson above. MinIO threw a loud error because of how docker-proxy handles the port class differently.)
 
 **Rule:** Before committing port bindings in `docker-compose.yml`, run:
 
@@ -492,7 +518,7 @@ ss -tlnp | grep :<port>
 docker ps -a | grep -i <service>
 ```
 
-If anything owns the port, **move** — never kill. Killing a container from an unrelated project is a foot-gun. In our case, Evergreen Command's MinIO moved to `:9010` (S3 API) and `:9011` (console) so both compose stacks can coexist.
+If anything owns the port, **move** — never kill. Killing a container from an unrelated project is a foot-gun. In Evergreen Command, MinIO is on `:9010` (S3 API) and `:9011` (console), and Postgres is on host `:5433`, so both compose stacks coexist with vault's `:9000`/`:9001`/`:5432`.
 
 **Also note:** `docker compose down -v` only removes resources in the **current compose project's namespace** (based on the directory name). Orphan containers from a previous compose project that shared the same container names will still be sitting there — `docker ps -a` is the only way to see them.
 
@@ -550,6 +576,8 @@ docker exec -i evergreen-command-db psql -U command -d evergreen_command < some.
 docker exec -it evergreen-command-db psql -U command -d evergreen_command
 ```
 
+Note: `docker exec` uses a Unix socket inside the container, which is covered by `pg_hba.conf`'s `local all all trust` rule — so it works even when TCP auth is failing on the published port. This is a great sanity-check path: if `docker exec` psql works but TCP from the host doesn't, the problem is either the hba rules or the port mapping itself.
+
 ---
 
 ## What's Been Done So Far
@@ -593,20 +621,16 @@ docker exec -it evergreen-command-db psql -U command -d evergreen_command
 - [x] Rebranded `app/layout.tsx`, `app/page.tsx`, `app/login/page.tsx`
 - [x] Rewrote `docker-compose.yml` for Evergreen Command branding + non-conflicting MinIO ports
 - [x] Updated `.env.example` to match
-- [x] `npm run build` passes cleanly (Next.js 15.5.15, 6 static pages, 2.4 s compile)
+- [x] `npm run build` passes cleanly (Next.js 15.5.15, 1.1 s compile post-dep-prune)
 - [x] `npm run db:generate` produces `0000_complete_bucky.sql` matching schema
-- [x] Applied schema directly via `docker exec psql < 0000_complete_bucky.sql` (workaround for drizzle-kit 0.31.x bug)
-- [x] All 5 tables verified present in `evergreen_command` database
+- [x] Applied schema to Postgres and verified all 5 tables present
+- [x] Pruned dead vault-era dependencies (`@aws-sdk/*`, `mammoth`, `pdfjs-dist`, `react-dropzone`, `@napi-rs/canvas`) — 141 packages total
+- [x] Rewrote `CLAUDE.md` for post-Phase-2 reality (npm, new stack versions, 7 non-negotiable rules)
+- [x] Diagnosed and fixed the Postgres port-hijack / Docker bridge NAT bug — moved host port to `5433`, confirmed `drizzle-kit push` connects successfully and reports `[✓] Changes applied`
 
 ---
 
 ## What's Left To Do
-
-### Phase 2 polish — small cleanups remaining 🟡
-- [ ] Bootstrap `__drizzle_migrations` tracking table so drizzle-kit migrate picks up from migration 0001 once upgraded
-- [ ] Upgrade `drizzle-kit` from 0.31.10 → 0.32+ to fix the silent migrate bug
-- [ ] Prune dead dependencies from `package.json` (`@aws-sdk/*`, `mammoth`, `pdfjs-dist`, `react-dropzone`, `@napi-rs/canvas`)
-- [ ] Rewrite `CLAUDE.md` for Evergreen Command (currently still has vault references)
 
 ### Phase 3 — Python worker 🔴
 
@@ -692,9 +716,12 @@ docker compose ps                   # list services with health status
 docker compose down                 # stop and remove containers (keeps volumes)
 docker compose down -v              # also remove named volumes (WIPES DATA)
 docker compose logs -f postgres     # tail Postgres logs
+
+# CRITICAL: verify the port mapping actually bound (silent-fail bug)
+docker ps --format 'table {{.Names}}\t{{.Ports}}' | grep evergreen-command
 ```
 
-### Postgres via docker exec
+### Postgres via docker exec (unix socket — always works)
 ```bash
 # List databases
 docker exec -it evergreen-command-db psql -U command -d evergreen_command -c "\l"
@@ -712,19 +739,27 @@ docker exec -i evergreen-command-db psql -U command -d evergreen_command < drizz
 docker exec -it evergreen-command-db psql -U command -d evergreen_command
 ```
 
+### Postgres from the host (TCP, port 5433)
+```bash
+# Raw postgres.js smoke test — great for diagnosing drizzle-kit silent failures
+node -e "const p=require('postgres');const s=p('postgresql://command:command_secret@127.0.0.1:5433/evergreen_command');s\`select current_user, inet_client_addr()\`.then(r=>{console.log('OK',r);return s.end()}).catch(e=>{console.error('FAIL',e.message);process.exit(1)})"
+
+# psql from host, via a throwaway postgres container (no local psql needed)
+docker run --rm --network host postgres:17 \
+  psql "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
+  -c "SELECT current_database(), current_user, inet_client_addr();"
+```
+
 ### Drizzle schema workflow
 ```bash
 # Generate a new migration from schema changes
 set -a && source .env.local && set +a && npm run db:generate
 
-# Apply migrations (broken on drizzle-kit 0.31.x — use direct SQL apply instead)
-set -a && source .env.local && set +a && npm run db:migrate
-
-# Direct SQL apply (fallback while drizzle-kit is broken)
-docker exec -i evergreen-command-db psql -U command -d evergreen_command < drizzle/0000_complete_bucky.sql
-
-# Alternative: push schema → DB without migration files
+# Push schema → DB (preferred for single-dev, the migrate CLI is flaky in 0.31.x)
 set -a && source .env.local && set +a && npm run db:push
+
+# Direct SQL apply (fallback if drizzle-kit is silent)
+docker exec -i evergreen-command-db psql -U command -d evergreen_command < drizzle/0000_complete_bucky.sql
 
 # Drizzle Studio (browser-based DB browser)
 set -a && source .env.local && set +a && npm run db:studio
@@ -765,4 +800,4 @@ npm run lint                          # ESLint
 
 ---
 
-*Last updated: 2026-04-10. Project state: **Phase 2 complete** — vault nuked, 5-table schema swapped, build passing in 2.4 s, all tables applied to Postgres. Next: Phase 3 (Python worker + tool registry port from evergreenagent).*
+*Last updated: 2026-04-10. Project state: **Phase 2 complete** — vault nuked, 5-table schema applied, build passing in 1.1 s, dead deps pruned, Postgres TCP routing fixed (host port 5433, drizzle-kit push green). Next: Phase 3 (Python worker + tool registry port from evergreenagent).*
