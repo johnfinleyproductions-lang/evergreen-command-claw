@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "evergreen-vault": {
+      "command": "node",
+      "args": ["mcp-server/dist/index.js"],
+      "env": {
+        "DATABASE_URL": "postgresql://vault:vault_secret@192.168.4.240:5432/evergreen_vault",
+        "OLLAMA_BASE_URL": "http://localhost:11434",
+        "OLLAMA_EMBEDDING_MODEL": "nomic-embed-text"
+      }
+    }
+  }
+}
