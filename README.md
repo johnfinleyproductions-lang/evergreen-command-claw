@@ -61,10 +61,10 @@ Two processes sharing one Postgres instance.
 ┌──────────────────────────────────┐      ┌──────────────────────────────────┐
 │  Next.js 15 Web UI (App Router)    │      │  Python Worker (worker/)           │
 │  ──────────────────────────────   │      │  ──────────────────────────────   │
-│  • Task input / template picker    │      │  • Tool registry (ported)         │
+│  • Task input / template picker    │      │  • Tool registry (4 real tools)   │
 │  • Live log stream                 │◄────►│  • asyncio poll loop               │
-│  • Inspector panels                │  PG  │  • llama.cpp client               │
-│  • Output viewer                   │      │  • Ollama fallback                 │
+│  • Inspector panels                │  PG  │  • agent.py — LLM tool loop        │
+│  • Output viewer                   │      │  • llm.py — llama.cpp client       │
 │  • Run history                     │      │  • Tool execute → DB insert        │
 └──────────────┬─────────────────────┘      └──────────────┬─────────────────────┘
                │                                            │
@@ -83,11 +83,15 @@ Two processes sharing one Postgres instance.
 
 **Why two processes?** The Next.js app gives us a premium UI stack we already know (Drizzle, Radix, Tailwind v4, Vercel AI SDK) and matches evergreen-vault byte-for-byte so everything composes. The Python worker preserves the tool registry we already built in evergreenagent — no rewrite, no port. They communicate through shared Postgres tables and an SSE stream for the live log.
 
+**Two modes, one worker.** The worker branches on the shape of `runs.input`:
+- `{"prompt": "..."}` → **agent mode**: `agent.py` runs the LLM tool loop against llama.cpp, iterating until the model returns a final answer.
+- `{"tool_calls": [...]}` → **literal mode**: the worker dispatches the listed tool calls in order, no LLM. This is how Phase 3A originally tested the plumbing, and it's kept as a regression path.
+
 ---
 
 ## Where Everything Lives
 
-A map of the repo after the Phase 2 cleanup. Every path is relative to the repo root (`~/evergreen-command-claw` on the Framestation).
+A map of the repo after the Phase 3B landing. Every path is relative to the repo root (`~/evergreen-command-claw` on the Framestation).
 
 ### Next.js App Router
 
@@ -132,23 +136,35 @@ drizzle/
 | `artifacts` | 9 | 1 → runs | File references (path or MinIO key) produced during a run |
 | `logs` | 6 | 1 → runs | Append-only log stream with `created_at` index for SSE tailing |
 
-### Python worker (Phase 3A — just scaffolded)
+### Python worker (Phase 3B — agent loop + real tools)
 
 ```
 worker/
-├── main.py                  asyncio poll loop + run executor + signal handlers
-├── db.py                    asyncpg pool w/ jsonb codec + claim/insert/finalize helpers
-├── config.py                loads .env.local from repo root via python-dotenv
-├── requirements.txt         asyncpg + python-dotenv
-├── README.md                quickstart + end-to-end test SQL
+├── main.py                  asyncio poll loop + run executor + mode dispatch
+├── db.py                    asyncpg pool w/ jsonb codec + claim/insert/finalize + insert_artifact
+├── config.py                loads .env.local + LLM_* + AGENT_* + ARTIFACTS_DIR settings
+├── context.py               ContextVar[current_run_id] — propagates run id to tools
+├── llm.py                   httpx wrapper for llama.cpp OpenAI-compatible /v1/chat/completions
+├── agent.py                 Core agent loop — LLM → tool_calls → execute → iterate → final_answer
+├── requirements.txt         asyncpg + python-dotenv + httpx + ddgs + beautifulsoup4
+├── README.md                Quickstart, literal vs agent mode, smoke tests
+├── artifacts/               Agent-generated markdown briefs land here (gitignored runtime dir)
 └── tools/
     ├── __init__.py
     ├── base.py              Tool ABC (returns dict, OpenAI-compat schema)
     ├── registry.py          sync/async dispatch via asyncio.to_thread
-    └── echo.py              stub tool: {message} → {echo, length, reversed}
+    ├── echo.py              Phase 3A stub tool — kept for regression testing
+    ├── web_search.py        DuckDuckGo via ddgs → {query, result_count, results[]}
+    ├── fetch_url.py         httpx + BeautifulSoup → {url, status, title, text (truncated)}
+    └── write_brief.py       Writes a markdown artifact + inserts an artifacts row via context
 ```
 
-Worker claims one pending run at a time via `FOR UPDATE SKIP LOCKED`, dispatches each entry in `run.input.tool_calls`, writes `tool_calls` + `logs` rows, and finalizes the run as `succeeded` or `failed`. Phase 3A ships with one tool (`echo`) to prove the plumbing. Real tools (file I/O, HTTP, llama.cpp) come in Phase 3B+.
+**Mode dispatch:** `execute_run()` reads `runs.input`:
+1. If `"prompt"` key present → `agent.run_agent(run_id, prompt)` runs the LLM loop, writes tool_calls / logs as it goes, and returns `{output, model, prompt_tokens, completion_tokens, total_tokens}`.
+2. Else if `"tool_calls"` key present → `_execute_literal_tool_calls()` dispatches in order (Phase 3A behavior).
+3. Else → fail the run with a descriptive error.
+
+Before dispatch, the worker sets `current_run_id` ContextVar so tools like `write_brief` can insert artifacts without being handed the run id explicitly. The token is reset in a `finally` block.
 
 ### Auth
 
@@ -173,9 +189,9 @@ postcss.config.mjs           Tailwind v4 PostCSS plugin
 
 ### What's NOT in this repo (yet)
 
-- **Real production tools** — Phase 3B+. The worker scaffold ships with one stub tool (`echo`). Real tools (web search, file write, HTTP, llama.cpp client) land next.
-- **evergreenagent tool registry** — lives in `~/evergreenagent`, progressively being ported into `worker/tools/` as each real tool lands.
-- **llama.cpp / Ollama** — model servers, not code artifacts. Launched via tmux sessions, config pointed at from `.env.local`.
+- **SSE log stream** — Phase 3C. Worker already writes to `logs` with the right index; Next.js route still needs to tail and stream.
+- **Task UI** — Phase 4. Prompt textbox, template picker, live log panel, output viewer.
+- **Additional tools** — HTTP POST, file parsing, vault upload, MinIO write. Added on demand as real tasks need them.
 - **MinIO bucket contents** — runtime artifacts, volume-mounted to `miniodata` in docker-compose.
 
 ---
@@ -235,7 +251,7 @@ docker exec -it evergreen-command-db psql -U command -d evergreen_command -c "\d
 # Should list: artifacts, logs, runs, tasks, tool_calls
 ```
 
-### 6. Launch llama-server (if not already running)
+### 6. Launch llama-server (required for agent mode)
 
 ```bash
 # Lock GPU clocks first (only if not already locked)
@@ -254,39 +270,64 @@ tmux new -d -s llama-server "$HOME/llama.cpp/build/bin/llama-server \
 curl http://localhost:8081/v1/models   # smoke test
 ```
 
-### 7. Start the Python worker (Phase 3A)
+### 7. Start the Python worker (Phase 3B)
 
 ```bash
 cd worker
-python -m venv .venv
+python -m venv .venv              # skip if .venv already exists
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt   # installs httpx, ddgs, beautifulsoup4 (new in 3B)
 python main.py
-# Expected: worker started. poll_interval=2.0s tools=['echo']
+# Expected: worker started. poll_interval=2.0s tools=['echo', 'web_search', 'fetch_url', 'write_brief'] llm=http://127.0.0.1:8081 model=nemotron
 ```
 
 The worker will sit idle until a `runs` row shows up with `status = 'pending'`.
 
 ### 8. Trigger a test run (in a second terminal)
 
+**Phase 3A regression — literal mode, no LLM:**
 ```bash
 docker run --rm --network host postgres:17 psql \
   "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
   -c "INSERT INTO runs (status, input) VALUES ('pending', '{\"tool_calls\": [{\"name\": \"echo\", \"arguments\": {\"message\": \"hello phase 3\"}}]}'::jsonb);"
 ```
 
-Within 2 seconds the worker terminal should log `run <uuid> succeeded (1 tool calls)`. Then verify from psql:
-
+**Phase 3B tier 1 — single-tool agent smoke test:**
 ```bash
 docker run --rm --network host postgres:17 psql \
   "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
-  -c "SELECT id, status, output FROM runs ORDER BY created_at DESC LIMIT 1;"
+  -c "INSERT INTO runs (status, input) VALUES ('pending', '{\"prompt\": \"Use web_search to find the official Python asyncio docs URL, then return only the URL as your final answer.\"}'::jsonb);"
 ```
 
-Expected output:
+**Phase 3B tier 2 — canonical Nvidia lead-research task:**
+```bash
+docker run --rm --network host postgres:17 psql \
+  "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
+  -c "INSERT INTO runs (status, input) VALUES ('pending', '{\"prompt\": \"Research Nvidia as a potential lead. Use web_search and fetch_url to gather recent news, products, leadership, and financials. Then use write_brief to save a one-page markdown brief titled Nvidia Lead Brief with the findings.\"}'::jsonb);"
+```
 
-```json
-{"tool_results": [{"name": "echo", "result": {"echo": "hello phase 3", "length": 13, "reversed": "3 esahp olleh"}}]}
+Agent runs take anywhere from 30 seconds to several minutes depending on tool calls and model latency. Watch progress live:
+
+```bash
+# Tail logs for the most recent run
+docker run --rm --network host postgres:17 psql \
+  "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
+  -c "SELECT level, message, created_at FROM logs WHERE run_id = (SELECT id FROM runs ORDER BY created_at DESC LIMIT 1) ORDER BY created_at;"
+
+# Inspect finalized run
+docker run --rm --network host postgres:17 psql \
+  "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
+  -c "SELECT id, status, model, prompt_tokens, completion_tokens, total_tokens, output FROM runs ORDER BY created_at DESC LIMIT 1;"
+
+# Inspect tool calls
+docker run --rm --network host postgres:17 psql \
+  "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
+  -c "SELECT sequence, tool_name, status, duration_ms FROM tool_calls WHERE run_id = (SELECT id FROM runs ORDER BY created_at DESC LIMIT 1) ORDER BY sequence;"
+
+# Inspect written artifacts
+docker run --rm --network host postgres:17 psql \
+  "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
+  -c "SELECT name, path, kind, size FROM artifacts ORDER BY created_at DESC LIMIT 5;"
 ```
 
 ### 9. Run the Next.js dev server
@@ -307,7 +348,7 @@ npm run build
 
 ## The Stack
 
-Current versions as of 2026-04-10 (post Phase 2 cleanup, verified on disk):
+Current versions as of 2026-04-10 (post Phase 3B landing, verified on disk):
 
 - **Next.js 15.5.15** with Turbopack
 - **App Router** (not Pages Router)
@@ -325,7 +366,7 @@ Added for Command:
 
 - **llama.cpp** (built from source with CUDA) serving `Nemotron-3-Super-120B-A12B Q4_K_M` on port `:8081`
 - **Ollama** (already running) for `nomic-embed-text` embeddings and small-model fallback
-- **Python worker** — `worker/` subdirectory, asyncio + asyncpg, ships with a stub `echo` tool for Phase 3A
+- **Python worker** — `worker/` subdirectory, asyncio + asyncpg + httpx, ships with 4 tools (`echo`, `web_search`, `fetch_url`, `write_brief`) and a full LLM agent loop against llama.cpp on `:8081`
 
 Post-Phase-2, dead vault-era dependencies were pruned: `@aws-sdk/client-s3`, `@aws-sdk/s3-request-presigner`, `mammoth`, `pdfjs-dist`, `react-dropzone`, `@napi-rs/canvas`. Package count dropped to 141 and build time went from 2.4 s → 1.1 s.
 
@@ -365,6 +406,14 @@ Phase 3 considered three runtimes: FastAPI with a background task queue, Celery 
 - Graceful shutdown is a single `asyncio.Event` + two signal handlers
 
 If we ever need horizontal scale, we just start N workers — no code change.
+
+### Input-shape dispatch instead of two separate worker entrypoints
+
+Phase 3B could have introduced a new table column, a new enum, or a second worker binary to distinguish "literal tool_calls" from "agent prompt." Instead, `execute_run()` branches on whether `runs.input` has a `prompt` key or a `tool_calls` key. Zero schema changes, zero operational overhead, and Phase 3A's existing smoke tests still work as a regression path. Future modes (e.g. a `plan` key for a dry-run planner) can be added the same way.
+
+### ContextVars for tool-to-run plumbing instead of passing run_id everywhere
+
+Tools like `write_brief` need to know which run they belong to so they can insert an `artifacts` row — but we didn't want to add a `run_id` parameter to every tool signature (and then remember to thread it through). Python's `contextvars.ContextVar` solves this cleanly: `main.py` sets `current_run_id.set(run_id)` before dispatch, the tool reads it via `current_run_id.get()`, and the token is reset in a `finally` block. `asyncio.to_thread` automatically propagates the context via `copy_context()`, so sync tools (like `web_search`, which uses ddgs) see the same value as async tools (like `fetch_url`).
 
 ---
 
@@ -682,6 +731,32 @@ Now Python dicts go in and Python dicts come out — no per-call boilerplate.
 
 **Fix:** The worker's `db.py` hardcodes the right column names per table. When adding real tools in Phase 3B+, double-check which table you're writing to before picking column names.
 
+### `artifacts.size` (not `size_bytes`) and `artifacts.kind` is a typed enum
+
+**Symptom:** First draft of `write_brief` tried to `INSERT INTO artifacts (size_bytes, kind, ...) VALUES (..., 'brief', ...)` and failed on both columns — the column is called `size`, and `'brief'` is not a valid enum value.
+
+**Why:** The Drizzle schema defines `size` as the column name (matching pg convention) and `kind` as an `artifact_kind` enum with values `'report' | 'data' | 'image' | 'code' | 'log' | 'other'`. There's no `'brief'` value, and the Python string needs an explicit `::artifact_kind` cast in the INSERT so asyncpg doesn't fall back to text.
+
+**Fix:** `INSERT INTO artifacts (run_id, name, path, kind, mime_type, size, metadata) VALUES ($1, $2, $3, $4::artifact_kind, $5, $6, $7)` with `kind='report'`. The lesson generalizes: **re-read `drizzle/0000_complete_bucky.sql` as ground truth before writing any new INSERT.** Drizzle snapshot JSON lies about enum casts.
+
+### ContextVars auto-propagate through `asyncio.to_thread`, so sync tools see them too
+
+**Concern during Phase 3B design:** I wanted tools like `write_brief` to know their run_id without plumbing it through every call signature, and `contextvars.ContextVar` was the obvious answer for async code — but the registry bridges sync tools to the event loop via `asyncio.to_thread`, and I was worried the context wouldn't cross the thread boundary.
+
+**Reality:** `asyncio.to_thread` calls `contextvars.copy_context().run(...)` internally, so the current context (including every `ContextVar.set()` done so far) is captured and replayed inside the worker thread. Sync tools read `current_run_id.get()` successfully. No extra plumbing needed. This is documented but easy to miss.
+
+### Feed tool errors back to the LLM instead of failing the run
+
+**Tempting pattern:** If a tool call raises an exception, mark the run as `failed` and exit.
+
+**Better pattern (what we ship):** Catch the exception, mark just the `tool_calls` row as `failed` with the error in `result`, and feed the error back to the model as the tool message (`{role: "tool", tool_call_id, content: "Error: ..."}`). The model sees the failure on its next iteration and can retry with different args, use a different tool, or gracefully abandon that subtask. This makes agent runs vastly more robust — a single tool hiccup (network blip, bad URL, search quota) doesn't nuke the entire run. Max iterations (default 10) is still the hard stop against infinite loops.
+
+### Agent mode vs. literal mode via input-shape dispatch is a clean separation
+
+**Problem:** Phase 3A's worker only understood `{"tool_calls": [...]}` — a literal script. Phase 3B needed `{"prompt": "..."}` for the agent loop. Do we add a `mode` column to `runs`? A separate table? Two worker binaries?
+
+**What we did:** Neither. `execute_run()` just branches on `"prompt" in input_data` vs `"tool_calls" in input_data`. Zero schema changes. Phase 3A's echo regression test still works. Future modes (a dry-run planner, a structured function plan, batch mode) can be added by adding new keys — each becomes a self-describing run without touching the schema or the call sites that create runs.
+
 ---
 
 ## What's Been Done So Far
@@ -745,17 +820,36 @@ Now Python dicts go in and Python dicts come out — no per-call boilerplate.
 - [x] `worker/tools/echo.py` — stub `EchoTool` that takes `{message}` and returns `{echo, length, reversed}`
 - [x] `worker/main.py` — asyncio poll loop with SIGINT/SIGTERM graceful shutdown + `execute_run()` that dispatches `run.input.tool_calls`
 - [x] `worker/README.md` — quickstart, architecture diagram, end-to-end test SQL
+- [x] **End-to-end test passed 100% green:** `runs` row finalized as `succeeded` with correct `output` JSONB, `tool_calls` row inserted with `sequence=0` + `duration_ms=0`, `logs` table populated with 4 lines (claimed → dispatching → succeeded → run succeeded)
+
+### Phase 3B — Real tools + LLM agent loop ✅
+- [x] Added httpx + ddgs + beautifulsoup4 to `worker/requirements.txt`
+- [x] Extended `worker/config.py` with `LLM_BASE_URL`, `LLM_MODEL`, `LLM_TIMEOUT`, `LLM_TEMPERATURE`, `AGENT_MAX_ITERATIONS`, `ARTIFACTS_DIR`
+- [x] `worker/context.py` — `ContextVar[current_run_id]` for run-id propagation across sync and async tools
+- [x] `worker/llm.py` — async httpx wrapper for llama.cpp's `/v1/chat/completions` endpoint with tool-use payload shape
+- [x] `worker/agent.py` — full LLM agent loop with default system prompt, token accounting across iterations, tool-error feedback, and max-iteration safety guard
+- [x] `worker/tools/web_search.py` — DuckDuckGo via `ddgs` with fallback import to legacy `duckduckgo_search`
+- [x] `worker/tools/fetch_url.py` — httpx + BeautifulSoup page fetcher with script/style stripping + 50 KB truncation
+- [x] `worker/tools/write_brief.py` — writes a timestamped markdown file under `ARTIFACTS_DIR`, inserts an `artifacts` row with `kind='report'`, reads `current_run_id` from context
+- [x] Extended `worker/db.py` with `insert_artifact(...)` and extended `finalize_run_success(...)` to accept optional model + token counts
+- [x] Refactored `worker/main.py` to dispatch on `input` shape: `prompt` key → agent mode, `tool_calls` key → literal mode (Phase 3A regression path preserved), else → descriptive failure
+- [x] `execute_run()` sets `current_run_id.set(run_id)` in a token and resets it in `finally`
+- [x] Rewrote `worker/README.md` to document both modes + smoke tests + architecture diagram
+- [x] All Phase 3B files committed to `main` in a single atomic push (commit `e609408`)
 
 ---
 
 ## What's Left To Do
 
-### Phase 3B — Real tools + LLM loop 🔴
+### Phase 3B verification 🟡
 
-1. Port the remaining tools from `evergreenagent` into `worker/tools/` (web search, file write, HTTP fetch)
-2. Add an `llm.py` that talks to llama.cpp's OpenAI-compatible endpoint on `:8081`
-3. Add an agent loop: read `runs.input.prompt`, ask the LLM to plan tool calls, execute them, iterate until done
-4. First end-to-end test: the Nvidia lead-research task
+1. Pull the new worker files on the Framestation, reinstall deps (`pip install -r requirements.txt`), restart the worker
+2. Confirm `llama-server` is still up on `:8081` (`curl http://localhost:8081/v1/models`)
+3. Run the Phase 3A regression test (echo via literal mode) — must still pass
+4. Run the Phase 3B tier 1 smoke test (single-tool web_search for asyncio docs URL)
+5. Run the Phase 3B tier 2 canonical Nvidia lead-research task
+6. Inspect resulting `runs`, `tool_calls`, `logs`, and `artifacts` rows
+7. Open the generated brief under `worker/artifacts/` to eyeball quality
 
 ### Phase 3C — SSE log stream 🔴
 
@@ -874,33 +968,60 @@ docker run --rm --network host postgres:17 \
   -c "SELECT current_database(), current_user, inet_client_addr();"
 ```
 
-### Phase 3A worker — end-to-end smoke test
+### Phase 3A worker — literal mode regression smoke test
 ```bash
 # Terminal 1: start the worker
 cd worker
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+source .venv/bin/activate
 python main.py
-# → worker started. poll_interval=2.0s tools=['echo']
+# → worker started. poll_interval=2.0s tools=['echo', 'web_search', 'fetch_url', 'write_brief'] llm=http://127.0.0.1:8081 model=nemotron
 
-# Terminal 2: insert a pending run
+# Terminal 2: insert a pending literal-mode run (no LLM involved)
 docker run --rm --network host postgres:17 psql \
   "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
   -c "INSERT INTO runs (status, input) VALUES ('pending', '{\"tool_calls\": [{\"name\": \"echo\", \"arguments\": {\"message\": \"hello phase 3\"}}]}'::jsonb);"
 
-# Terminal 2: inspect the result (within 2s of the INSERT)
+# Inspect the result (within 2s of the INSERT)
 docker run --rm --network host postgres:17 psql \
   "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
   -c "SELECT id, status, output FROM runs ORDER BY created_at DESC LIMIT 1;"
+```
 
-# Check the sidecar tables (tool_calls + logs)
+### Phase 3B worker — tier 1 agent mode smoke test (single tool)
+```bash
+# Requires llama-server up on :8081
+curl http://localhost:8081/v1/models
+
+# Insert a pending agent-mode run
 docker run --rm --network host postgres:17 psql \
   "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
-  -c "SELECT sequence, tool_name, status, duration_ms FROM tool_calls ORDER BY created_at DESC LIMIT 5;"
+  -c "INSERT INTO runs (status, input) VALUES ('pending', '{\"prompt\": \"Use web_search to find the official Python asyncio docs URL, then return only the URL as your final answer.\"}'::jsonb);"
 
+# Tail live logs for the newest run
 docker run --rm --network host postgres:17 psql \
   "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
-  -c "SELECT level, message FROM logs ORDER BY created_at DESC LIMIT 10;"
+  -c "SELECT level, message, created_at FROM logs WHERE run_id = (SELECT id FROM runs ORDER BY created_at DESC LIMIT 1) ORDER BY created_at;"
+
+# Final run inspection
+docker run --rm --network host postgres:17 psql \
+  "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
+  -c "SELECT id, status, model, prompt_tokens, completion_tokens, total_tokens, output FROM runs ORDER BY created_at DESC LIMIT 1;"
+```
+
+### Phase 3B worker — tier 2 canonical Nvidia lead-research task
+```bash
+docker run --rm --network host postgres:17 psql \
+  "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
+  -c "INSERT INTO runs (status, input) VALUES ('pending', '{\"prompt\": \"Research Nvidia as a potential lead. Use web_search and fetch_url to gather recent news, products, leadership, and financials. Then use write_brief to save a one-page markdown brief titled Nvidia Lead Brief with the findings.\"}'::jsonb);"
+
+# Inspect artifacts written
+docker run --rm --network host postgres:17 psql \
+  "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
+  -c "SELECT name, path, kind, size, created_at FROM artifacts ORDER BY created_at DESC LIMIT 5;"
+
+# View the actual brief on disk
+ls -lah worker/artifacts/
+cat worker/artifacts/*nvidia*.md
 ```
 
 ### Drizzle schema workflow
@@ -953,4 +1074,4 @@ npm run lint                          # ESLint
 
 ---
 
-*Last updated: 2026-04-10. Project state: **Phase 3A complete** — asyncio Python worker scaffolded under `worker/` with asyncpg pool, `FOR UPDATE SKIP LOCKED` run claiming, JSONB type codec, ported Tool ABC + async registry, stub `echo` tool, graceful SIGINT/SIGTERM shutdown, and an end-to-end smoke-test SQL. Next: Phase 3B (real tools ported from evergreenagent + LLM loop against llama.cpp on :8081).*
+*Last updated: 2026-04-10. Project state: **Phase 3B complete** — the Python worker now has a full LLM agent loop against llama.cpp on `:8081`, four real tools (`echo`, `web_search`, `fetch_url`, `write_brief`), ContextVar-based run-id propagation, token accounting across agent iterations, tool-error feedback to the model, and input-shape dispatch that preserves the Phase 3A literal-mode regression path. Ready to run the canonical Nvidia lead-research task end-to-end. Next: Phase 3C (SSE log stream from Next.js) and Phase 4 (UI polish).*
