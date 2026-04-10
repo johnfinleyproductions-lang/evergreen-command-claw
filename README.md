@@ -58,12 +58,12 @@ The canonical first task is **"research Nvidia as a potential lead and save a br
 Two processes sharing one Postgres instance.
 
 ```
-┌────────────────────────────────────┐      ┌────────────────────────────────────┐
-│  Next.js 15 Web UI (App Router)    │      │  Python Worker (evergreenagent)    │
-│  ───────────────────────────────   │      │  ───────────────────────────────   │
-│  • Task input / template picker    │      │  • Tool registry                   │
-│  • Live log stream                 │◄────►│  • Agent loop                      │
-│  • Inspector panels                │  PG  │  • llama.cpp client                │
+┌──────────────────────────────────┐      ┌──────────────────────────────────┐
+│  Next.js 15 Web UI (App Router)    │      │  Python Worker (worker/)           │
+│  ──────────────────────────────   │      │  ──────────────────────────────   │
+│  • Task input / template picker    │      │  • Tool registry (ported)         │
+│  • Live log stream                 │◄────►│  • asyncio poll loop               │
+│  • Inspector panels                │  PG  │  • llama.cpp client               │
 │  • Output viewer                   │      │  • Ollama fallback                 │
 │  • Run history                     │      │  • Tool execute → DB insert        │
 └──────────────┬─────────────────────┘      └──────────────┬─────────────────────┘
@@ -75,10 +75,10 @@ Two processes sharing one Postgres instance.
                   └──────────────┘
                           ▲
                           │
-            ┌─────────────┴──────────────┐
+            ┌─────────────┬──────────────┐
             │   llama.cpp (port :8081)   │  Nemotron-3-Super-120B Q4_K_M
             │   Ollama    (port :11434)  │  Embeddings + small-model fallback
-            └────────────────────────────┘
+            └──────────────────────────────┘
 ```
 
 **Why two processes?** The Next.js app gives us a premium UI stack we already know (Drizzle, Radix, Tailwind v4, Vercel AI SDK) and matches evergreen-vault byte-for-byte so everything composes. The Python worker preserves the tool registry we already built in evergreenagent — no rewrite, no port. They communicate through shared Postgres tables and an SSE stream for the live log.
@@ -132,6 +132,24 @@ drizzle/
 | `artifacts` | 9 | 1 → runs | File references (path or MinIO key) produced during a run |
 | `logs` | 6 | 1 → runs | Append-only log stream with `created_at` index for SSE tailing |
 
+### Python worker (Phase 3A — just scaffolded)
+
+```
+worker/
+├── main.py                  asyncio poll loop + run executor + signal handlers
+├── db.py                    asyncpg pool w/ jsonb codec + claim/insert/finalize helpers
+├── config.py                loads .env.local from repo root via python-dotenv
+├── requirements.txt         asyncpg + python-dotenv
+├── README.md                quickstart + end-to-end test SQL
+└── tools/
+    ├── __init__.py
+    ├── base.py              Tool ABC (returns dict, OpenAI-compat schema)
+    ├── registry.py          sync/async dispatch via asyncio.to_thread
+    └── echo.py              stub tool: {message} → {echo, length, reversed}
+```
+
+Worker claims one pending run at a time via `FOR UPDATE SKIP LOCKED`, dispatches each entry in `run.input.tool_calls`, writes `tool_calls` + `logs` rows, and finalizes the run as `succeeded` or `failed`. Phase 3A ships with one tool (`echo`) to prove the plumbing. Real tools (file I/O, HTTP, llama.cpp) come in Phase 3B+.
+
 ### Auth
 
 ```
@@ -155,8 +173,8 @@ postcss.config.mjs           Tailwind v4 PostCSS plugin
 
 ### What's NOT in this repo (yet)
 
-- **Python worker** — Phase 3. Will live in a `worker/` subdirectory or as a sibling repo pointing at the same Postgres instance.
-- **evergreenagent tool registry** — lives in `~/evergreenagent`, will be ported into the worker.
+- **Real production tools** — Phase 3B+. The worker scaffold ships with one stub tool (`echo`). Real tools (web search, file write, HTTP, llama.cpp client) land next.
+- **evergreenagent tool registry** — lives in `~/evergreenagent`, progressively being ported into `worker/tools/` as each real tool lands.
 - **llama.cpp / Ollama** — model servers, not code artifacts. Launched via tmux sessions, config pointed at from `.env.local`.
 - **MinIO bucket contents** — runtime artifacts, volume-mounted to `miniodata` in docker-compose.
 
@@ -169,6 +187,7 @@ Everything you need to get this running on the Framestation from a fresh clone.
 ### 1. Prerequisites
 
 - Node.js 20+ and npm (already on the Framestation)
+- Python 3.11+ and `python -m venv` (already on CachyOS)
 - Docker + docker compose (already on the Framestation)
 - llama.cpp built with CUDA support in `~/llama.cpp/build/bin/` (see Phase 1)
 - The Nemotron GGUF shards in `~/models/nemotron-3-super-120b/`
@@ -235,14 +254,49 @@ tmux new -d -s llama-server "$HOME/llama.cpp/build/bin/llama-server \
 curl http://localhost:8081/v1/models   # smoke test
 ```
 
-### 7. Run the Next.js dev server
+### 7. Start the Python worker (Phase 3A)
+
+```bash
+cd worker
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python main.py
+# Expected: worker started. poll_interval=2.0s tools=['echo']
+```
+
+The worker will sit idle until a `runs` row shows up with `status = 'pending'`.
+
+### 8. Trigger a test run (in a second terminal)
+
+```bash
+docker run --rm --network host postgres:17 psql \
+  "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
+  -c "INSERT INTO runs (status, input) VALUES ('pending', '{\"tool_calls\": [{\"name\": \"echo\", \"arguments\": {\"message\": \"hello phase 3\"}}]}'::jsonb);"
+```
+
+Within 2 seconds the worker terminal should log `run <uuid> succeeded (1 tool calls)`. Then verify from psql:
+
+```bash
+docker run --rm --network host postgres:17 psql \
+  "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
+  -c "SELECT id, status, output FROM runs ORDER BY created_at DESC LIMIT 1;"
+```
+
+Expected output:
+
+```json
+{"tool_results": [{"name": "echo", "result": {"echo": "hello phase 3", "length": 13, "reversed": "3 esahp olleh"}}]}
+```
+
+### 9. Run the Next.js dev server
 
 ```bash
 npm run dev
 # Open http://localhost:3000 — the minimal landing page
 ```
 
-### 8. Verify the build still compiles cleanly
+### 10. Verify the build still compiles cleanly
 
 ```bash
 npm run build
@@ -271,7 +325,7 @@ Added for Command:
 
 - **llama.cpp** (built from source with CUDA) serving `Nemotron-3-Super-120B-A12B Q4_K_M` on port `:8081`
 - **Ollama** (already running) for `nomic-embed-text` embeddings and small-model fallback
-- **Python worker** (FastAPI or plain asyncio, TBD) — ports the tool registry from evergreenagent
+- **Python worker** — `worker/` subdirectory, asyncio + asyncpg, ships with a stub `echo` tool for Phase 3A
 
 Post-Phase-2, dead vault-era dependencies were pruned: `@aws-sdk/client-s3`, `@aws-sdk/s3-request-presigner`, `mammoth`, `pdfjs-dist`, `react-dropzone`, `@napi-rs/canvas`. Package count dropped to 141 and build time went from 2.4 s → 1.1 s.
 
@@ -299,6 +353,18 @@ The original plan called for a fresh Next.js scaffold — this was wrong. Evergr
 ### Next.js App Router instead of React + Vite (from the brief)
 
 The project brief originally suggested React + Vite. We overrode this because every other Evergreen dashboard is Next.js App Router — keeping the stack uniform means components, hooks, and DB schemas cross-pollinate between projects for free.
+
+### asyncio + asyncpg for the worker, not FastAPI or Celery
+
+Phase 3 considered three runtimes: FastAPI with a background task queue, Celery with Redis, and plain asyncio. We picked plain asyncio because:
+
+- No extra infra — no Redis, no broker, no worker/scheduler split
+- Postgres is already the queue via `FOR UPDATE SKIP LOCKED`
+- Concurrent workers are safe for free (SKIP LOCKED handles the race)
+- `asyncpg` is the fastest Postgres driver in Python and speaks JSONB natively via type codecs
+- Graceful shutdown is a single `asyncio.Event` + two signal handlers
+
+If we ever need horizontal scale, we just start N workers — no code change.
 
 ---
 
@@ -336,6 +402,16 @@ sudo nvidia-smi -lgc "${GPU_CLOCK},${GPU_CLOCK}"
 With the documented rule: **"NEVER change clocks mid-inference. Always kill the running workload first, change clocks, then restart. Always use locked clocks (min=max): `nvidia-smi -lgc 1933,1933` not `nvidia-smi -lgc 300,1933`."**
 
 We reuse this exact pattern and clock value before launching `llama-server`.
+
+### evergreenagent is the perfect tool registry template
+
+Read directly from the `johnfinleyproductions-lang/evergreenagrent` GitHub repo (note the typo in the repo name):
+
+- `tools/base.py` — clean `Tool` ABC with `name`, `description`, `parameters` (JSON Schema), and `execute(**kwargs)`. Already emits OpenAI-compatible function-calling schemas via `to_schema()`.
+- `tools/registry.py` — `ToolRegistry` class with `register()`, `schemas` property, and dispatch `execute()`.
+- `tools/web_search.py` — DuckDuckGo search tool as a reference implementation.
+
+For the worker, we ported these with two deliberate changes: (1) `execute()` returns a `dict` instead of a string so it can be stored natively as JSONB, and (2) the registry supports both sync and async tools, bridging sync ones to the event loop via `asyncio.to_thread`.
 
 ---
 
@@ -552,7 +628,7 @@ set -a && source .env.local && set +a && npm run db:migrate
 
 **Fix (what we did):** Deleted `mcp-server/` entirely because it was all vault-specific code anyway.
 
-**Fix (if we had wanted to keep it):** Add `"exclude": ["mcp-server/**", "worker/**", ...]` to the root `tsconfig.json` so the subpackage has to be built independently.
+**Fix (if we had wanted to keep it):** Add `"exclude": ["mcp-server/**", "worker/**", ...]` to the root `tsconfig.json` so the subpackage has to be built independently. (We've now shipped `worker/` as a Python subpackage, which sidesteps this entirely — Python is invisible to tsc.)
 
 ### Postgres runs in Docker on the Framestation, not natively
 
@@ -577,6 +653,34 @@ docker exec -it evergreen-command-db psql -U command -d evergreen_command
 ```
 
 Note: `docker exec` uses a Unix socket inside the container, which is covered by `pg_hba.conf`'s `local all all trust` rule — so it works even when TCP auth is failing on the published port. This is a great sanity-check path: if `docker exec` psql works but TCP from the host doesn't, the problem is either the hba rules or the port mapping itself.
+
+### asyncpg needs a connection-level JSONB type codec to round-trip Python dicts
+
+**Symptom:** Passing a plain `dict` to a JSONB column produced `DataError: invalid input for query argument: expected str, got dict`. Passing `json.dumps(d)` stored the payload fine but reading it back gave a `str`, not a `dict`, forcing every caller to re-parse.
+
+**Fix:** Register a type codec on every pool connection via the `init` hook so JSONB auto-encodes on write and auto-decodes on read:
+
+```python
+async def _init_connection(conn):
+    await conn.set_type_codec(
+        "jsonb",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
+
+pool = await asyncpg.create_pool(dsn=..., init=_init_connection)
+```
+
+Now Python dicts go in and Python dicts come out — no per-call boilerplate.
+
+### Schema column naming: `runs` uses `input`/`output`, but `tool_calls` uses `arguments`/`result`
+
+**Symptom:** First pass of the worker tried to `INSERT INTO tool_calls (input, output, ...)` and got `column "input" does not exist`.
+
+**Why:** The Drizzle schema was deliberately built with different naming to match two different mental models: a `run` has an `input` payload (the user's prompt + tool_calls list) and an `output` payload (the final result), while a `tool_call` has `arguments` (what the LLM passed) and a `result` (what the tool returned). Both concepts are valid; they just use different words. Also worth noting: `runs.finished_at` (not `completed_at`) and status value `succeeded` (not `completed`).
+
+**Fix:** The worker's `db.py` hardcodes the right column names per table. When adding real tools in Phase 3B+, double-check which table you're writing to before picking column names.
 
 ---
 
@@ -628,16 +732,36 @@ Note: `docker exec` uses a Unix socket inside the container, which is covered by
 - [x] Rewrote `CLAUDE.md` for post-Phase-2 reality (npm, new stack versions, 7 non-negotiable rules)
 - [x] Diagnosed and fixed the Postgres port-hijack / Docker bridge NAT bug — moved host port to `5433`, confirmed `drizzle-kit push` connects successfully and reports `[✓] Changes applied`
 
+### Phase 3A — Python worker scaffold (stub echo tool) ✅
+- [x] Decided on asyncio + asyncpg + plain Postgres as the queue (no Redis, no Celery, no FastAPI)
+- [x] Read evergreenagrent source (`tools/base.py`, `tools/registry.py`, `tools/web_search.py`) as the porting target
+- [x] Re-read Drizzle schema to confirm exact column names per table
+- [x] Created `worker/` subdirectory (one git history, one repo)
+- [x] `worker/requirements.txt` — asyncpg + python-dotenv
+- [x] `worker/config.py` — loads `.env.local` from repo root via upward path walk
+- [x] `worker/db.py` — asyncpg pool with JSONB type codec, `claim_next_run()` via `FOR UPDATE SKIP LOCKED`, insert/complete/fail tool calls, write logs, finalize runs
+- [x] `worker/tools/base.py` — ported `Tool` ABC, now returns `dict` (not str) for JSONB storage
+- [x] `worker/tools/registry.py` — ported with async dispatch (`inspect.iscoroutinefunction` + `asyncio.to_thread` for sync tools)
+- [x] `worker/tools/echo.py` — stub `EchoTool` that takes `{message}` and returns `{echo, length, reversed}`
+- [x] `worker/main.py` — asyncio poll loop with SIGINT/SIGTERM graceful shutdown + `execute_run()` that dispatches `run.input.tool_calls`
+- [x] `worker/README.md` — quickstart, architecture diagram, end-to-end test SQL
+
 ---
 
 ## What's Left To Do
 
-### Phase 3 — Python worker 🔴
+### Phase 3B — Real tools + LLM loop 🔴
 
-1. Port the tool registry from `evergreenagent` into a worker process
-2. Wire worker ↔ Postgres: worker polls `runs` table, writes `tool_calls` + `logs`
-3. SSE endpoint from Next.js streams `logs` rows to the UI in real time
+1. Port the remaining tools from `evergreenagent` into `worker/tools/` (web search, file write, HTTP fetch)
+2. Add an `llm.py` that talks to llama.cpp's OpenAI-compatible endpoint on `:8081`
+3. Add an agent loop: read `runs.input.prompt`, ask the LLM to plan tool calls, execute them, iterate until done
 4. First end-to-end test: the Nvidia lead-research task
+
+### Phase 3C — SSE log stream 🔴
+
+1. SSE endpoint from Next.js tails `logs` rows for a given `run_id` and streams them to the UI
+2. Re-use the `created_at` index on `logs` we already shipped in the schema
+3. Worker writes → Postgres NOTIFY → Next.js SSE route → browser EventSource
 
 ### Phase 4 — UI polish 🔴
 
@@ -750,6 +874,35 @@ docker run --rm --network host postgres:17 \
   -c "SELECT current_database(), current_user, inet_client_addr();"
 ```
 
+### Phase 3A worker — end-to-end smoke test
+```bash
+# Terminal 1: start the worker
+cd worker
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python main.py
+# → worker started. poll_interval=2.0s tools=['echo']
+
+# Terminal 2: insert a pending run
+docker run --rm --network host postgres:17 psql \
+  "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
+  -c "INSERT INTO runs (status, input) VALUES ('pending', '{\"tool_calls\": [{\"name\": \"echo\", \"arguments\": {\"message\": \"hello phase 3\"}}]}'::jsonb);"
+
+# Terminal 2: inspect the result (within 2s of the INSERT)
+docker run --rm --network host postgres:17 psql \
+  "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
+  -c "SELECT id, status, output FROM runs ORDER BY created_at DESC LIMIT 1;"
+
+# Check the sidecar tables (tool_calls + logs)
+docker run --rm --network host postgres:17 psql \
+  "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
+  -c "SELECT sequence, tool_name, status, duration_ms FROM tool_calls ORDER BY created_at DESC LIMIT 5;"
+
+docker run --rm --network host postgres:17 psql \
+  "postgresql://command:command_secret@127.0.0.1:5433/evergreen_command" \
+  -c "SELECT level, message FROM logs ORDER BY created_at DESC LIMIT 10;"
+```
+
 ### Drizzle schema workflow
 ```bash
 # Generate a new migration from schema changes
@@ -800,4 +953,4 @@ npm run lint                          # ESLint
 
 ---
 
-*Last updated: 2026-04-10. Project state: **Phase 2 complete** — vault nuked, 5-table schema applied, build passing in 1.1 s, dead deps pruned, Postgres TCP routing fixed (host port 5433, drizzle-kit push green). Next: Phase 3 (Python worker + tool registry port from evergreenagent).*
+*Last updated: 2026-04-10. Project state: **Phase 3A complete** — asyncio Python worker scaffolded under `worker/` with asyncpg pool, `FOR UPDATE SKIP LOCKED` run claiming, JSONB type codec, ported Tool ABC + async registry, stub `echo` tool, graceful SIGINT/SIGTERM shutdown, and an end-to-end smoke-test SQL. Next: Phase 3B (real tools ported from evergreenagent + LLM loop against llama.cpp on :8081).*
