@@ -10,15 +10,17 @@ Bring-your-own-GPU agentic workflows — no API tokens, no cloud round-trips, no
 1. [What This Is](#what-this-is)
 2. [Hardware Target: The Framestation](#hardware-target-the-framestation)
 3. [Architecture Overview](#architecture-overview)
-4. [The Stack](#the-stack)
-5. [Why We Chose What We Chose](#why-we-chose-what-we-chose)
-6. [Pre-Research Findings](#pre-research-findings)
-7. [Lessons Learned](#lessons-learned)
-8. [What's Been Done So Far](#whats-been-done-so-far)
-9. [What's Left To Do](#whats-left-to-do)
-10. [Phase 5+ Ideas (Parked)](#phase-5-ideas-parked)
-11. [Open Questions](#open-questions)
-12. [Reference Commands](#reference-commands)
+4. [Where Everything Lives](#where-everything-lives)
+5. [Dev Environment Quickstart](#dev-environment-quickstart)
+6. [The Stack](#the-stack)
+7. [Why We Chose What We Chose](#why-we-chose-what-we-chose)
+8. [Pre-Research Findings](#pre-research-findings)
+9. [Lessons Learned](#lessons-learned)
+10. [What's Been Done So Far](#whats-been-done-so-far)
+11. [What's Left To Do](#whats-left-to-do)
+12. [Phase 5+ Ideas (Parked)](#phase-5-ideas-parked)
+13. [Open Questions](#open-questions)
+14. [Reference Commands](#reference-commands)
 
 ---
 
@@ -83,26 +85,195 @@ Two processes sharing one Postgres instance.
 
 ---
 
+## Where Everything Lives
+
+A map of the repo after the Phase 2 cleanup. Every path is relative to the repo root (`~/evergreen-command-claw` on the Framestation).
+
+### Next.js App Router
+
+```
+app/
+├── layout.tsx               Root HTML layout + metadata ("Evergreen Command")
+├── page.tsx                 Landing page (minimal, Phase 4 will replace)
+├── login/page.tsx           HMAC single-password login → redirects to /
+└── api/
+    └── auth/login/route.ts  POST { password } → sets httpOnly session cookie
+```
+
+Everything under `app/(vault)/` and `app/api/` that wasn't `auth/login` was deleted during Phase 2. The new task UI will rebuild under `app/` in Phase 4.
+
+### Database (Drizzle + Postgres)
+
+```
+lib/db/
+├── client.ts                Lazy-singleton postgres.js client via Proxy
+└── schema/
+    ├── index.ts             Barrel export — this is what drizzle.config.ts points at
+    ├── tasks.ts             Task definitions (templates)
+    ├── runs.ts              Individual task executions
+    ├── toolCalls.ts         Per-step tool invocations within a run
+    ├── artifacts.ts         Files + MinIO object references produced by runs
+    └── logs.ts              Streaming log entries for SSE
+
+drizzle/
+├── 0000_complete_bucky.sql  Generated CREATE TABLE SQL (the live schema)
+└── meta/
+    ├── _journal.json        Drizzle-kit's migration journal (gitignored)
+    └── 0000_snapshot.json   Schema snapshot for diffing on next generate
+```
+
+**The 5 tables:**
+
+| Table | Columns | FKs | Purpose |
+|---|---|---|---|
+| `tasks` | 10 | 0 | Named, reusable task templates with prompt + tools_allowed[] + tags[] |
+| `runs` | 14 | 1 → tasks | A single execution; holds status, model, tokens, timings |
+| `tool_calls` | 10 | 1 → runs | Each tool invocation with input/output JSONB |
+| `artifacts` | 9 | 1 → runs | File references (path or MinIO key) produced during a run |
+| `logs` | 6 | 1 → runs | Append-only log stream with `created_at` index for SSE tailing |
+
+### Auth
+
+```
+lib/auth/
+├── api-key.ts               Pure crypto helpers for REST API key header check
+└── session.ts               HMAC cookie login/logout + verify (next/headers)
+
+middleware.ts                Cookie gate: unauthenticated → /login (except /login + /api/auth/*)
+```
+
+### Config
+
+```
+drizzle.config.ts            Points at ./lib/db/schema/index.ts, out: ./drizzle
+docker-compose.yml           Postgres (:5432) + MinIO (:9010 S3, :9011 console)
+next.config.ts               Next.js config (mostly defaults)
+tsconfig.json                Root TS config — include glob is **/*.ts **/*.tsx
+postcss.config.mjs           Tailwind v4 PostCSS plugin
+.env.example                 All env vars documented — copy to .env.local
+```
+
+### What's NOT in this repo (yet)
+
+- **Python worker** — Phase 3. Will live in a `worker/` subdirectory or as a sibling repo pointing at the same Postgres instance.
+- **evergreenagent tool registry** — lives in `~/evergreenagent`, will be ported into the worker.
+- **llama.cpp / Ollama** — model servers, not code artifacts. Launched via tmux sessions, config pointed at from `.env.local`.
+- **MinIO bucket contents** — runtime artifacts, volume-mounted to `miniodata` in docker-compose.
+
+---
+
+## Dev Environment Quickstart
+
+Everything you need to get this running on the Framestation from a fresh clone.
+
+### 1. Prerequisites
+
+- Node.js 20+ and npm (already on the Framestation)
+- Docker + docker compose (already on the Framestation)
+- llama.cpp built with CUDA support in `~/llama.cpp/build/bin/` (see Phase 1)
+- The Nemotron GGUF shards in `~/models/nemotron-3-super-120b/`
+
+### 2. Clone + install
+
+```bash
+git clone git@github.com:johnfinleyproductions-lang/evergreen-command-claw.git
+cd evergreen-command-claw
+npm install
+```
+
+### 3. Env config
+
+```bash
+cp .env.example .env.local
+# Edit .env.local to set AUTH_SECRET, AUTH_PASSWORD, COMMAND_API_KEY to real values.
+# The Postgres URL default already matches docker-compose.yml.
+```
+
+### 4. Start the database (Postgres only for now — MinIO deferred to Phase 4)
+
+```bash
+docker compose up -d postgres
+docker compose ps postgres   # wait for "Up (healthy)"
+```
+
+### 5. Apply the schema
+
+Because of a known drizzle-kit 0.31.x silent-migrate bug (see Lessons Learned), we apply the SQL directly on a fresh database:
+
+```bash
+docker exec -i evergreen-command-db psql -U command -d evergreen_command < drizzle/0000_complete_bucky.sql
+docker exec -it evergreen-command-db psql -U command -d evergreen_command -c "\dt"
+# Should list: artifacts, logs, runs, tasks, tool_calls
+```
+
+For subsequent migrations once drizzle-kit is upgraded to 0.32+, use:
+
+```bash
+set -a && source .env.local && set +a && npm run db:migrate
+```
+
+### 6. Launch llama-server (if not already running)
+
+```bash
+# Lock GPU clocks first (only if not already locked)
+sudo nvidia-smi -pm 1 && sudo nvidia-smi -lgc 1933,1933
+
+tmux new -d -s llama-server "$HOME/llama.cpp/build/bin/llama-server \
+  -m $HOME/models/nemotron-3-super-120b/nvidia_Nemotron-3-Super-120B-A12B-Q4_K_M/nvidia_Nemotron-3-Super-120B-A12B-Q4_K_M-00001-of-00003.gguf \
+  --n-gpu-layers 26 \
+  --ctx-size 8192 \
+  --threads 32 \
+  --flash-attn on \
+  --host 0.0.0.0 \
+  --port 8081 \
+  2>&1 | tee $HOME/llama-server.log"
+
+curl http://localhost:8081/v1/models   # smoke test
+```
+
+### 7. Run the Next.js dev server
+
+```bash
+npm run dev
+# Open http://localhost:3000 — the minimal landing page
+```
+
+### 8. Verify the build still compiles cleanly
+
+```bash
+npm run build
+# Should compile in ~2-3 seconds with no errors
+```
+
+---
+
 ## The Stack
 
-Inherited from evergreen-vault (confirmed via GitHub API read of `package.json`):
+Current versions as of 2026-04-10 (post Phase 2 cleanup, verified on disk):
 
-- **Next.js 15.3.2** with Turbopack
+- **Next.js 15.5.15** with Turbopack
 - **App Router** (not Pages Router)
-- **Drizzle ORM 0.45.1** + **drizzle-kit 0.31.1**
+- **React 19.1** + React DOM 19.1
+- **Drizzle ORM 0.45.2** + **drizzle-kit 0.31.10** ⚠️ *(0.31.x has a silent migrate bug — pin issue in README, upgrade path is 0.32+)*
 - **postgres.js 3.4.8**
 - **Tailwind CSS v4** + `@tailwindcss/postcss`
-- **Radix UI** full set
+- **Radix UI** (dialog, dropdown, scroll-area, select, separator, slot, tabs, toast, tooltip)
 - **Vercel AI SDK** (`ai` 6.0.116 + `@ai-sdk/openai` 1.3.22) — talks directly to llama.cpp's OpenAI-compatible endpoint
-- **middleware.ts** for auth/routing
-- **docker-compose.yml** for local Postgres
-- **mammoth** + **pdfjs-dist** for file parsing (inherited from vault, useful here too)
+- **lucide-react 0.511** for icons
+- **middleware.ts** for auth/routing (HMAC cookie gate)
+- **docker-compose.yml** for local Postgres + MinIO
 
 Added for Command:
 
 - **llama.cpp** (built from source with CUDA) serving `Nemotron-3-Super-120B-A12B Q4_K_M` on port `:8081`
 - **Ollama** (already running) for `nomic-embed-text` embeddings and small-model fallback
 - **Python worker** (FastAPI or plain asyncio, TBD) — ports the tool registry from evergreenagent
+
+**Dead dependencies still in package.json** (Phase 2 tech debt, does not block build, will be pruned before Phase 3):
+
+- `@aws-sdk/client-s3`, `@aws-sdk/s3-request-presigner` — vault-era, replaced by MinIO/S3 if needed later
+- `mammoth`, `pdfjs-dist`, `react-dropzone` — vault file-parsing pipeline, Command doesn't parse uploads
+- `@napi-rs/canvas` — vault image processing
 
 ---
 
@@ -294,6 +465,91 @@ Dropping from 28 → 26 GPU layers on this 120 B MoE gave up **zero** generation
 
 **Rule:** Tune layers to a headroom target (~89%), not to "fill the GPU." The speed ceiling is set by CPU dispatch, not GPU layer count. Only prompt processing takes a modest hit (13-15%), and that's a one-time per-request cost invisible in real agent workloads.
 
+### drizzle-kit 0.31.x silently no-ops on `migrate` and exits with code 1
+
+**Symptom:** `npm run db:migrate` prints `Using 'postgres' driver for database querying` and then exits to the shell. No applied-migration list, no error message, no traceback. `\dt` shows zero tables afterwards. Running `npx drizzle-kit migrate; echo $?` reveals `exit code: 1` — so it **is** failing, it's just swallowing the error.
+
+**Versions affected:** Confirmed on `drizzle-kit 0.31.10` + `drizzle-orm 0.45.2` + `postgres 3.4.8` against a fresh Postgres 17.9 instance. Known bug in the 0.31.x line, fixed in 0.32+.
+
+**Workaround (what we do today):** Apply the SQL directly via psql. The generated SQL file is correct; only the migrator CLI is broken:
+
+```bash
+docker exec -i evergreen-command-db psql -U command -d evergreen_command < drizzle/0000_complete_bucky.sql
+```
+
+**Followup (not yet done):** Upgrade to drizzle-kit 0.32+, then backfill the `__drizzle_migrations` tracking table with a row for `0000_complete_bucky` so the next `migrate` doesn't try to re-apply the first migration.
+
+**Alternative going forward:** `drizzle-kit push` syncs schema → DB directly without migration files. Simpler for a single-developer project, but loses the audit trail.
+
+### Docker port coexistence: always `ss -tlnp` before binding
+
+**Symptom:** `docker compose up -d` failed with `Bind for 0.0.0.0:9000 failed: port is already allocated`. Turned out the old `evergreen-vault-minio` container was still running on `:9000-9001` from a different project, and I'd naively assumed the new compose file could reuse those ports.
+
+**Rule:** Before committing port bindings in `docker-compose.yml`, run:
+
+```bash
+ss -tlnp | grep :<port>
+docker ps -a | grep -i <service>
+```
+
+If anything owns the port, **move** — never kill. Killing a container from an unrelated project is a foot-gun. In our case, Evergreen Command's MinIO moved to `:9010` (S3 API) and `:9011` (console) so both compose stacks can coexist.
+
+**Also note:** `docker compose down -v` only removes resources in the **current compose project's namespace** (based on the directory name). Orphan containers from a previous compose project that shared the same container names will still be sitting there — `docker ps -a` is the only way to see them.
+
+### Next.js auto-loads `.env.local`, but drizzle-kit CLI does not
+
+**Symptom:** `npm run db:migrate` errored with `Please provide required params for Postgres driver: [x] url: undefined` even though `.env.local` was committed with `DATABASE_URL=...`.
+
+**Why:** Next.js runtime auto-loads `.env` and `.env.local` via its built-in env loader. Drizzle-kit is a **standalone Node CLI** that does not. It only sees variables that are already exported in the parent shell.
+
+**Fix:** Auto-export when sourcing:
+
+```bash
+set -a && source .env.local && set +a && npm run db:migrate
+```
+
+`set -a` flips on auto-export; every variable assigned while it's active gets exported to child processes. `set +a` turns it back off. This is the cleanest way to bridge a `.env.local` file into any CLI that doesn't auto-load env files.
+
+### Parallel GitHub `delete_file` calls race on the branch ref SHA
+
+**Symptom:** Running 10 parallel `mcp__github__delete_file` calls during the Phase 2 vault nuke produced ~20% failures with `422 Update is not a fast forward`. Dropping to 5 parallel still had ~40% failures on the second batch.
+
+**Why:** Each `delete_file` call internally reads the current branch ref, stages a commit, and pushes. Parallel calls all read the **same** starting SHA, so only the first one to land fast-forwards cleanly — the rest fail because the ref has moved.
+
+**Fix:** Serial deletes only. One file per tool call. 100% reliable, ~3-5 seconds per file. Slower but predictable. This is a GitHub API limitation, not an MCP bug.
+
+### Root `tsconfig.json` include glob pulls sibling subpackages into type-check
+
+**Symptom:** After deleting the vault UI/API, the build still had dangling type errors from files under `mcp-server/src/*.ts` that imported the now-deleted vault schema.
+
+**Why:** The root `tsconfig.json` had `"include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"]`. The `**/*.ts` glob is greedy — it pulled everything under `mcp-server/` into the root type-check pass, even though `mcp-server/` had its own `tsconfig.json` and was meant to be its own subpackage.
+
+**Fix (what we did):** Deleted `mcp-server/` entirely because it was all vault-specific code anyway.
+
+**Fix (if we had wanted to keep it):** Add `"exclude": ["mcp-server/**", "worker/**", ...]` to the root `tsconfig.json` so the subpackage has to be built independently.
+
+### Postgres runs in Docker on the Framestation, not natively
+
+**Symptom:** `sudo -u postgres psql` failed with `sudo: unknown user postgres`, and `psql` itself wasn't on `$PATH`.
+
+**Why:** CachyOS doesn't have a system `postgres` user because Postgres isn't installed via pacman — it runs inside the `pgvector/pgvector:pg17` container from `docker-compose.yml`. All psql access has to go through `docker exec`.
+
+**Pattern:**
+
+```bash
+# List databases
+docker exec -it evergreen-command-db psql -U command -d evergreen_command -c "\l"
+
+# List tables
+docker exec -it evergreen-command-db psql -U command -d evergreen_command -c "\dt"
+
+# Apply a SQL file (note: docker exec -i, not -it, for stdin piping)
+docker exec -i evergreen-command-db psql -U command -d evergreen_command < some.sql
+
+# Interactive shell
+docker exec -it evergreen-command-db psql -U command -d evergreen_command
+```
+
 ---
 
 ## What's Been Done So Far
@@ -316,7 +572,7 @@ Dropping from 28 → 26 GPU layers on this 120 B MoE gave up **zero** generation
 - [x] Built from source with CUDA enabled
 - [x] Confirmed Blackwell detection at startup
 
-### Phase 1 launch ✅
+### Phase 1 — llama-server launch ✅
 - [x] Stopped `voxstation_voice` Docker container (freed 8.8 GB VRAM)
 - [x] Locked GPU clocks at 1933 MHz
 - [x] Launched llama-server in detached tmux
@@ -324,57 +580,33 @@ Dropping from 28 → 26 GPU layers on this 120 B MoE gave up **zero** generation
 - [x] Recorded 12.96 tok/s production baseline at 26 layers + threads 32 + flash-attn on
 - [x] Verified inference via curl Paris test
 
-### Repo seeding ✅
+### Phase 2 — Fork + schema swap ✅
 - [x] GitHub repo created: `johnfinleyproductions-lang/evergreen-command-claw`
 - [x] Forked evergreen-vault as clean base (single initial commit, no history)
-- [x] Phase 2 docs + endpoint wiring committed
+- [x] Committed Phase 2 planning docs
+- [x] Wrote new 5-table Drizzle schema (tasks, runs, tool_calls, artifacts, logs)
+- [x] Deleted all vault-era UI routes under `app/(vault)/` (12 files)
+- [x] Deleted all vault-era API routes under `app/api/` (25 files)
+- [x] Deleted vault-era `lib/rag/*` and `lib/storage/minio.ts` (9 files)
+- [x] Deleted orphaned layout components (sidebar, header)
+- [x] Deleted entire `mcp-server/` vault subpackage (5 files)
+- [x] Rebranded `app/layout.tsx`, `app/page.tsx`, `app/login/page.tsx`
+- [x] Rewrote `docker-compose.yml` for Evergreen Command branding + non-conflicting MinIO ports
+- [x] Updated `.env.example` to match
+- [x] `npm run build` passes cleanly (Next.js 15.5.15, 6 static pages, 2.4 s compile)
+- [x] `npm run db:generate` produces `0000_complete_bucky.sql` matching schema
+- [x] Applied schema directly via `docker exec psql < 0000_complete_bucky.sql` (workaround for drizzle-kit 0.31.x bug)
+- [x] All 5 tables verified present in `evergreen_command` database
 
 ---
 
 ## What's Left To Do
 
-### Phase 1 — Launch llama-server ✅ DONE
-
-**Production config (locked): `--n-gpu-layers 26 --threads 32 --flash-attn on --ctx-size 8192`**
-
-Final baseline (2026-04-09, measured):
-
-| Metric | Value |
-|---|---|
-| Generation speed | **12.96 tok/s** |
-| Prompt processing | **28.74 tok/s** |
-| VRAM used | 28,998 / 32,623 MiB (~89%) |
-| VRAM headroom | 3.6 GB |
-| GPU clocks | 1933 MHz (locked) |
-| Power draw | 33 W / 186 W (CPU-bottlenecked on MoE dispatch) |
-| Temp | 26 °C |
-| Endpoint | `http://localhost:8081/v1/` (OpenAI-compatible) |
-
-**Launch command for restarts (production):**
-```bash
-tmux new -d -s llama-server "$HOME/llama.cpp/build/bin/llama-server \
-  -m $HOME/models/nemotron-3-super-120b/nvidia_Nemotron-3-Super-120B-A12B-Q4_K_M/nvidia_Nemotron-3-Super-120B-A12B-Q4_K_M-00001-of-00003.gguf \
-  --n-gpu-layers 26 \
-  --ctx-size 8192 \
-  --threads 32 \
-  --flash-attn on \
-  --host 0.0.0.0 \
-  --port 8081 \
-  2>&1 | tee $HOME/llama-server.log"
-```
-
-Run `sudo nvidia-smi -pm 1 && sudo nvidia-smi -lgc 1933,1933` before launch if clocks aren't already locked.
-
-### Phase 2 — Fork evergreen-vault into evergreen-command 🟡 IN PROGRESS
-
-1. [x] Fork `evergreen-vault` → `evergreen-command-claw` (clean, no history)
-2. [x] Overwrite README.md + CLAUDE.md with Command-specific docs
-3. [x] Update `.env.example` to point at local llama-server on :8081
-4. [ ] Swap `drizzle` schema: drop vault tables, add `tasks`, `runs`, `tool_calls`, `artifacts`, `logs`
-5. [ ] Rewrite landing page to the task input / template picker from the mockup
-6. [ ] Wire the Vercel AI SDK to the local llama.cpp endpoint
-7. [ ] Update `FramestationAgent` `config.py` to point at `:8081` as the heavy model
-8. [ ] First `npm install && npm run dev` against the local 120 B model
+### Phase 2 polish — small cleanups remaining 🟡
+- [ ] Bootstrap `__drizzle_migrations` tracking table so drizzle-kit migrate picks up from migration 0001 once upgraded
+- [ ] Upgrade `drizzle-kit` from 0.31.10 → 0.32+ to fix the silent migrate bug
+- [ ] Prune dead dependencies from `package.json` (`@aws-sdk/*`, `mammoth`, `pdfjs-dist`, `react-dropzone`, `@napi-rs/canvas`)
+- [ ] Rewrite `CLAUDE.md` for Evergreen Command (currently still has vault references)
 
 ### Phase 3 — Python worker 🔴
 
@@ -389,6 +621,7 @@ Run `sudo nvidia-smi -pm 1 && sudo nvidia-smi -lgc 1933,1933` before launch if c
 2. Resolve parked mockup feedback questions (see Open Questions)
 3. Template picker populates a prompt library
 4. Inspector panels pull live VRAM/RAM/clock data from a Framestation health endpoint
+5. Bring up MinIO (`docker compose up -d minio`) and wire artifact uploads
 
 ### Phase 5+ — Future capability layers (parked)
 
@@ -451,6 +684,52 @@ docker stop <container>
 docker update --restart=no <container>
 ```
 
+### Docker compose — Evergreen Command services
+```bash
+docker compose up -d postgres       # start only Postgres (Phase 2+)
+docker compose up -d                # start Postgres + MinIO (Phase 4+)
+docker compose ps                   # list services with health status
+docker compose down                 # stop and remove containers (keeps volumes)
+docker compose down -v              # also remove named volumes (WIPES DATA)
+docker compose logs -f postgres     # tail Postgres logs
+```
+
+### Postgres via docker exec
+```bash
+# List databases
+docker exec -it evergreen-command-db psql -U command -d evergreen_command -c "\l"
+
+# List tables
+docker exec -it evergreen-command-db psql -U command -d evergreen_command -c "\dt"
+
+# Describe a table
+docker exec -it evergreen-command-db psql -U command -d evergreen_command -c "\d tasks"
+
+# Apply a SQL file (note: -i not -it for stdin piping)
+docker exec -i evergreen-command-db psql -U command -d evergreen_command < drizzle/0000_complete_bucky.sql
+
+# Interactive psql shell
+docker exec -it evergreen-command-db psql -U command -d evergreen_command
+```
+
+### Drizzle schema workflow
+```bash
+# Generate a new migration from schema changes
+set -a && source .env.local && set +a && npm run db:generate
+
+# Apply migrations (broken on drizzle-kit 0.31.x — use direct SQL apply instead)
+set -a && source .env.local && set +a && npm run db:migrate
+
+# Direct SQL apply (fallback while drizzle-kit is broken)
+docker exec -i evergreen-command-db psql -U command -d evergreen_command < drizzle/0000_complete_bucky.sql
+
+# Alternative: push schema → DB without migration files
+set -a && source .env.local && set +a && npm run db:push
+
+# Drizzle Studio (browser-based DB browser)
+set -a && source .env.local && set +a && npm run db:studio
+```
+
 ### llama-server launch (production config)
 ```bash
 tmux new -d -s llama-server "$HOME/llama.cpp/build/bin/llama-server \
@@ -476,6 +755,14 @@ tmux attach -t <session>              # Ctrl+b then d to detach, never Ctrl+c
 tmux kill-session -t <session>
 ```
 
+### Next.js dev workflow
+```bash
+npm install                           # one-time setup
+npm run dev                           # dev server at :3000 with Turbopack
+npm run build                         # production build (verify nothing's broken)
+npm run lint                          # ESLint
+```
+
 ---
 
-*Last updated: 2026-04-09. Project state: **Phase 2 in progress** — repo forked, docs committed, endpoint wiring in place. Next: schema swap + first `npm run dev` against the local 120 B model.*
+*Last updated: 2026-04-10. Project state: **Phase 2 complete** — vault nuked, 5-table schema swapped, build passing in 2.4 s, all tables applied to Postgres. Next: Phase 3 (Python worker + tool registry port from evergreenagent).*
