@@ -2,12 +2,16 @@
 //
 // Phase 3C — Run detail page. Server component that loads the run by id
 // and mounts <RunLogPanel /> which streams logs via SSE.
+// Phase 5.0 — Added right-rail <ArtifactPanel /> (client component, polls
+// while run is non-terminal). Layout expanded from max-w-5xl single column
+// to max-w-7xl flex with lg:w-80 right rail.
 
 import { eq } from "drizzle-orm";
 import { notFound } from "next/navigation";
 import { db } from "@/lib/db/client";
 import { runs } from "@/lib/db/schema";
 import { RunLogPanel } from "./run-log-panel";
+import { ArtifactPanel } from "./artifact-panel";
 
 export const dynamic = "force-dynamic";
 
@@ -53,7 +57,7 @@ export default async function RunDetailPage({
       : null;
 
   return (
-    <main className="mx-auto max-w-5xl p-6 md:p-10">
+    <main className="mx-auto max-w-7xl p-6 md:p-10">
       <header className="mb-8">
         <div className="flex items-center gap-3 mb-2">
           <h1 className="font-mono text-2xl font-semibold tracking-tight">
@@ -71,44 +75,56 @@ export default async function RunDetailPage({
           {run.tokensPerSec != null && (
             <span>{run.tokensPerSec.toFixed(1)} tok/s</span>
           )}
-          {durationSec != null && (
-            <span>{durationSec.toFixed(1)}s</span>
-          )}
+          {durationSec != null && <span>{durationSec.toFixed(1)}s</span>}
           <span>created: {new Date(run.createdAt).toLocaleString()}</span>
         </div>
       </header>
 
-      {run.input != null && (
-        <section className="mb-6">
-          <h2 className="text-sm font-medium mb-2 text-muted-foreground">Input</h2>
-          <pre className="bg-muted/40 border rounded-md p-3 text-xs overflow-auto max-h-64">
-            {JSON.stringify(run.input, null, 2)}
-          </pre>
-        </section>
-      )}
+      <div className="flex flex-col lg:flex-row gap-6">
+        <div className="flex-1 min-w-0 space-y-6">
+          {run.input != null && (
+            <section>
+              <h2 className="text-sm font-medium mb-2 text-muted-foreground">
+                Input
+              </h2>
+              <pre className="bg-muted/40 border rounded-md p-3 text-xs overflow-auto max-h-64">
+                {JSON.stringify(run.input, null, 2)}
+              </pre>
+            </section>
+          )}
 
-      <section className="mb-6">
-        <h2 className="text-sm font-medium mb-2 text-muted-foreground">Logs</h2>
-        <RunLogPanel runId={run.id} />
-      </section>
+          <section>
+            <h2 className="text-sm font-medium mb-2 text-muted-foreground">
+              Logs
+            </h2>
+            <RunLogPanel runId={run.id} />
+          </section>
 
-      {run.errorMessage && (
-        <section className="mb-6">
-          <h2 className="text-sm font-medium mb-2 text-red-600">Error</h2>
-          <pre className="bg-red-50 text-red-900 border border-red-200 rounded-md p-3 text-xs overflow-auto max-h-64">
-            {run.errorMessage}
-          </pre>
-        </section>
-      )}
+          {run.errorMessage && (
+            <section>
+              <h2 className="text-sm font-medium mb-2 text-red-600">Error</h2>
+              <pre className="bg-red-50 text-red-900 border border-red-200 rounded-md p-3 text-xs overflow-auto max-h-64">
+                {run.errorMessage}
+              </pre>
+            </section>
+          )}
 
-      {run.output != null && (
-        <section className="mb-6">
-          <h2 className="text-sm font-medium mb-2 text-muted-foreground">Output</h2>
-          <pre className="bg-muted/40 border rounded-md p-3 text-xs overflow-auto max-h-96">
-            {JSON.stringify(run.output, null, 2)}
-          </pre>
-        </section>
-      )}
+          {run.output != null && (
+            <section>
+              <h2 className="text-sm font-medium mb-2 text-muted-foreground">
+                Output
+              </h2>
+              <pre className="bg-muted/40 border rounded-md p-3 text-xs overflow-auto max-h-96">
+                {JSON.stringify(run.output, null, 2)}
+              </pre>
+            </section>
+          )}
+        </div>
+
+        <aside className="lg:w-80 lg:shrink-0">
+          <ArtifactPanel runId={run.id} runStatus={run.status} />
+        </aside>
+      </div>
     </main>
   );
 }
