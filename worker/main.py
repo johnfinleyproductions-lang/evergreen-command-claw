@@ -149,14 +149,36 @@ async def execute_run(run: asyncpg.Record) -> None:
             prompt = input_data["prompt"]
             system = input_data.get("system")
             result = await run_agent(run_id, prompt, system=system)
+            agent_output = result["output"]
+
+            # Always persist the output + token usage first so the UI has the
+            # trace even on failure paths.
             await finalize_run_success(
                 run_id,
-                result["output"],
+                agent_output,
                 model=result.get("model"),
                 prompt_tokens=result.get("prompt_tokens"),
                 completion_tokens=result.get("completion_tokens"),
                 total_tokens=result.get("total_tokens"),
             )
+
+            # If the agent hit its iteration ceiling without converging, flip
+            # the run to failed. finalize_run_failure only updates status /
+            # error_message / finished_at — the output jsonb is preserved.
+            if agent_output.get("error") == "max_iterations_exceeded":
+                await finalize_run_failure(
+                    run_id,
+                    "Agent hit max iterations without converging on a final answer",
+                )
+                await write_log(
+                    run_id,
+                    "warn",
+                    "run marked failed: max iterations exceeded",
+                    {
+                        "iterations": agent_output.get("iterations"),
+                        "tool_calls_made": agent_output.get("tool_calls_made"),
+                    },
+                )
             await write_log(
                 run_id,
                 "info",

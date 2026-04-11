@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { TopNav } from "@/components/top-nav";
 
 export const metadata: Metadata = {
   title: "Evergreen Command",
@@ -13,7 +14,10 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" className="dark">
-      <body className="antialiased">{children}</body>
+      <body className="antialiased">
+        <TopNav />
+        {children}
+      </body>
     </html>
   );
 }

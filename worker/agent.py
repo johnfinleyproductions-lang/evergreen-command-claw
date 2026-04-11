@@ -109,7 +109,37 @@ async def run_agent(
             )
 
             try:
-                response = await llm.chat(messages, tools=tool_schemas)
+                remaining = config.AGENT_MAX_ITERATIONS - iteration
+                is_last_iteration = remaining == 1
+
+                # Ephemeral budget reminder — not persisted into messages,
+                # rebuilt each turn so the context window stays clean.
+                call_messages = messages
+                if remaining <= 2:
+                    call_messages = messages + [{
+                        "role": "system",
+                        "content": (
+                            f"ITERATION BUDGET: You have {remaining} call(s) left. "
+                            "You MUST stop calling tools and write your final answer now, "
+                            "synthesizing whatever information you already have. "
+                            "Do not request more searches or fetches."
+                        ),
+                    }]
+                elif remaining <= 5:
+                    call_messages = messages + [{
+                        "role": "system",
+                        "content": (
+                            f"Iteration budget: {remaining} calls remaining out of "
+                            f"{config.AGENT_MAX_ITERATIONS}. Prefer synthesizing an answer "
+                            "from the information you already have over running more searches. "
+                            "Only call more tools if absolutely critical."
+                        ),
+                    }]
+
+                # On the final iteration, strip tools entirely so the model is
+                # forced to return a text-only final answer (finish_reason=stop).
+                call_tools = None if is_last_iteration else tool_schemas
+                response = await llm.chat(call_messages, tools=call_tools)
             except Exception as exc:
                 err = f"LLM call failed: {type(exc).__name__}: {exc}"
                 log.exception("llm.chat failed")
