@@ -1,27 +1,19 @@
 // app/api/artifacts/[id]/content/route.ts
 //
-// Phase 5.0 — Stream artifact file contents.
+// Phase 5.0.1 — Serve artifact content from Postgres (with legacy file fallback).
 //
-// Security model:
-//   1. ARTIFACTS_DIR must be set in process.env. We fail loud with 500 if
-//      not — no fallback, no silent defaults, no drift between worker and
-//      web app.
-//   2. We resolve both the configured ARTIFACTS_DIR and the artifact's
-//      stored `path` via fs.realpath, then verify the artifact's real
-//      path lives strictly inside ARTIFACTS_DIR with a trailing-separator
-//      prefix check. This defeats both relative-path traversal and
-//      symlink escapes.
-//   3. The raw filesystem `path` column is never sent to the client from
-//      any API route. It exists only server-side, read here and in
-//      worker/tools/write_brief.py.
+// The Phase 5.0 version tried to coordinate disk paths between the Python
+// worker and the Next.js app and required ARTIFACTS_DIR + realpath
+// containment checks. That returned 500 in practice because two processes
+// on the same machine disagreed about filesystem state.
+//
+// This version reads from the `content` column on the artifacts table.
+// For legacy rows (content IS NULL), it falls back to the Phase 5.0 file
+// path logic so old runs keep working.
 //
 // Response:
 //   - Content-Type = artifacts.mime_type (or application/octet-stream)
 //   - Content-Disposition = inline by default; attachment if ?download=1
-//
-// Artifacts are small markdown briefs (single-digit KB), so we readFile
-// into a Buffer rather than piping. If we ever store images or large
-// files, swap to a ReadableStream via Readable.toWeb(createReadStream(...)).
 
 import { NextRequest, NextResponse } from "next/server";
 import { eq } from "drizzle-orm";
@@ -46,23 +38,14 @@ export async function GET(
     return NextResponse.json({ error: "id must be a uuid" }, { status: 400 });
   }
 
-  const artifactsDir = process.env.ARTIFACTS_DIR;
-  if (!artifactsDir) {
-    return NextResponse.json(
-      {
-        error:
-          "ARTIFACTS_DIR is not set. Add it to .env.local — must match the value worker/config.py uses.",
-      },
-      { status: 500 },
-    );
-  }
-
   const [row] = await db
     .select({
       id: artifacts.id,
       name: artifacts.name,
       path: artifacts.path,
       mimeType: artifacts.mimeType,
+      content: artifacts.content,
+      contentSize: artifacts.contentSize,
     })
     .from(artifacts)
     .where(eq(artifacts.id, id))
@@ -72,8 +55,38 @@ export async function GET(
     return NextResponse.json({ error: "not found" }, { status: 404 });
   }
 
-  // Resolve both sides of the containment check through realpath so symlinks
-  // cannot sneak the artifact out of the sandbox.
+  const contentType = row.mimeType ?? "application/octet-stream";
+  const download = new URL(request.url).searchParams.get("download") === "1";
+  const disposition = download
+    ? `attachment; filename="${sanitizeFilename(row.name)}"`
+    : `inline; filename="${sanitizeFilename(row.name)}"`;
+
+  // --- Path A: content lives in the DB (Phase 5.0.1+, happy path) ---
+  if (row.content !== null && row.content !== undefined) {
+    const bytes = Buffer.from(row.content, "utf-8");
+    return new NextResponse(bytes, {
+      status: 200,
+      headers: {
+        "Content-Type": contentType,
+        "Content-Length": String(bytes.byteLength),
+        "Content-Disposition": disposition,
+        "Cache-Control": "private, no-cache",
+      },
+    });
+  }
+
+  // --- Path B: legacy file-based artifact (backwards compatibility) ---
+  const artifactsDir = process.env.ARTIFACTS_DIR;
+  if (!artifactsDir) {
+    return NextResponse.json(
+      {
+        error:
+          "Legacy artifact requires ARTIFACTS_DIR. Add it to .env.local or re-run the task to populate the content column.",
+      },
+      { status: 500 },
+    );
+  }
+
   let realRoot: string;
   let realPath: string;
   try {
@@ -90,7 +103,6 @@ export async function GET(
   try {
     realPath = await realpath(path.resolve(row.path));
   } catch {
-    // 410 Gone — row survived a deletion on disk.
     return NextResponse.json(
       { error: "Artifact file is missing on disk" },
       { status: 410 },
@@ -122,11 +134,6 @@ export async function GET(
   }
 
   const bytes = await readFile(realPath);
-  const contentType = row.mimeType ?? "application/octet-stream";
-  const download = new URL(request.url).searchParams.get("download") === "1";
-  const disposition = download
-    ? `attachment; filename="${sanitizeFilename(row.name)}"`
-    : `inline; filename="${sanitizeFilename(row.name)}"`;
 
   return new NextResponse(bytes, {
     status: 200,
@@ -140,7 +147,5 @@ export async function GET(
 }
 
 function sanitizeFilename(name: string): string {
-  // Keep it ASCII-safe for Content-Disposition filename= — write_brief
-  // already slugs on the way in, but belt and suspenders.
   return name.replace(/"/g, "").replace(/[\r\n]/g, " ");
 }
