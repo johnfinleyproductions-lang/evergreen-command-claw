@@ -2,9 +2,13 @@
 
 "use client";
 
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import type { Task } from "@/lib/db/schema/tasks";
+import {
+  extractTemplateVars,
+  renderPromptTemplate,
+} from "@/lib/prompt-template";
 
 type Mode = "template" | "custom";
 
@@ -12,6 +16,23 @@ type Props = {
   tasks: Task[];
   initialTaskId?: string;
 };
+
+/**
+ * Pull a human-readable hint for a template variable out of the task's
+ * JSON-Schema-shaped inputSchema column, if one exists. Returns undefined
+ * when no description is defined so callers can fall back to a generic
+ * placeholder.
+ */
+function getVarDescription(
+  inputSchema: unknown,
+  varName: string,
+): string | undefined {
+  if (!inputSchema || typeof inputSchema !== "object") return undefined;
+  const schema = inputSchema as {
+    properties?: Record<string, { description?: string } | undefined>;
+  };
+  return schema.properties?.[varName]?.description;
+}
 
 export function NewRunForm({ tasks, initialTaskId }: Props) {
   const router = useRouter();
@@ -30,9 +51,34 @@ export function NewRunForm({ tasks, initialTaskId }: Props) {
 
   const selectedTask = tasks.find((t) => t.id === selectedTaskId);
 
+  // Pull {{vars}} out of the selected task's prompt.
+  const vars = useMemo(
+    () => (selectedTask ? extractTemplateVars(selectedTask.prompt) : []),
+    [selectedTask],
+  );
+
+  // One string state per variable. Reset whenever the selected task changes
+  // so we don't leak inputs across templates.
+  const [values, setValues] = useState<Record<string, string>>({});
+  useEffect(() => {
+    const initial: Record<string, string> = {};
+    for (const v of vars) initial[v] = "";
+    setValues(initial);
+  }, [selectedTaskId, vars]);
+
+  // Live preview of the rendered prompt as the user types.
+  const preview = useMemo(() => {
+    if (!selectedTask) return "";
+    return renderPromptTemplate(selectedTask.prompt, values);
+  }, [selectedTask, values]);
+
+  const allVarsFilled = vars.every((v) => values[v]?.trim().length > 0);
+
   const canSubmit =
     !submitting &&
-    ((mode === "template" && selectedTaskId.length > 0) ||
+    ((mode === "template" &&
+      selectedTaskId.length > 0 &&
+      (vars.length === 0 || allVarsFilled)) ||
       (mode === "custom" && customPrompt.trim().length > 0));
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -43,7 +89,7 @@ export function NewRunForm({ tasks, initialTaskId }: Props) {
     try {
       const body =
         mode === "template"
-          ? { taskId: selectedTaskId }
+          ? { taskId: selectedTaskId, inputVars: values }
           : { prompt: customPrompt };
 
       const res = await fetch("/api/runs", {
@@ -114,35 +160,89 @@ export function NewRunForm({ tasks, initialTaskId }: Props) {
             </div>
 
             {selectedTask && (
-              <div className="rounded-lg border border-gray-800 bg-surface/50 p-4">
-                {selectedTask.description && (
-                  <p className="text-sm text-text-muted mb-3">
-                    {selectedTask.description}
-                  </p>
-                )}
-                <div className="text-xs text-text-dim mb-1">Prompt</div>
-                <pre className="text-xs text-text whitespace-pre-wrap font-mono bg-black/30 p-3 rounded max-h-48 overflow-auto">
-                  {selectedTask.prompt}
-                </pre>
-                {selectedTask.toolsAllowed &&
-                  selectedTask.toolsAllowed.length > 0 && (
-                    <div className="mt-3">
-                      <div className="text-xs text-text-dim mb-1">
-                        Tools allowed
-                      </div>
-                      <div className="flex flex-wrap gap-1">
-                        {selectedTask.toolsAllowed.map((tool) => (
-                          <span
-                            key={tool}
-                            className="px-2 py-0.5 text-xs bg-gray-800 text-text rounded"
-                          >
-                            {tool}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
+              <>
+                <div className="rounded-lg border border-gray-800 bg-surface/50 p-4">
+                  {selectedTask.description && (
+                    <p className="text-sm text-text-muted mb-3">
+                      {selectedTask.description}
+                    </p>
                   )}
-              </div>
+                  {selectedTask.toolsAllowed &&
+                    selectedTask.toolsAllowed.length > 0 && (
+                      <div>
+                        <div className="text-xs text-text-dim mb-1">
+                          Tools allowed
+                        </div>
+                        <div className="flex flex-wrap gap-1">
+                          {selectedTask.toolsAllowed.map((tool) => (
+                            <span
+                              key={tool}
+                              className="px-2 py-0.5 text-xs bg-gray-800 text-text rounded"
+                            >
+                              {tool}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                </div>
+
+                {vars.length > 0 && (
+                  <div className="space-y-4">
+                    <div>
+                      <h3 className="text-sm font-medium text-text">
+                        Inputs
+                      </h3>
+                      <p className="text-xs text-text-dim mt-1">
+                        Fill in the {vars.length} variable
+                        {vars.length === 1 ? "" : "s"} this task needs before
+                        firing the run.
+                      </p>
+                    </div>
+                    {vars.map((name) => {
+                      const hint = getVarDescription(
+                        selectedTask.inputSchema,
+                        name,
+                      );
+                      return (
+                        <div key={name}>
+                          <label className="block text-sm font-medium text-text mb-1 font-mono">
+                            {`{{${name}}}`}
+                          </label>
+                          {hint && (
+                            <p className="text-xs text-text-dim mb-2">
+                              {hint}
+                            </p>
+                          )}
+                          <textarea
+                            value={values[name] ?? ""}
+                            onChange={(e) =>
+                              setValues((prev) => ({
+                                ...prev,
+                                [name]: e.target.value,
+                              }))
+                            }
+                            rows={4}
+                            placeholder={
+                              hint ?? `Value for {{${name}}}…`
+                            }
+                            className="w-full px-3 py-2 bg-gray-900 border border-gray-800 rounded-md text-text text-sm font-mono focus:outline-none focus:border-emerald-600 resize-y"
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <div>
+                  <div className="text-xs text-text-dim mb-1">
+                    {vars.length === 0 ? "Prompt" : "Preview"}
+                  </div>
+                  <pre className="text-xs text-text whitespace-pre-wrap font-mono bg-black/40 border border-gray-800 p-3 rounded max-h-64 overflow-auto">
+                    {preview}
+                  </pre>
+                </div>
+              </>
             )}
           </>
         ) : (
