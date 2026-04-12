@@ -3,6 +3,13 @@
 Uses contextvars to read the current run_id so the tool can insert an
 artifacts row pointing back at the run that produced it. Falls back to a
 loose insert if no run_id context is set (shouldn't happen in production).
+
+Phase 5.0.1: the brief content is now stored in the `artifacts.content`
+column as the authoritative source. We still write a disk copy to
+ARTIFACTS_DIR as a belt-and-suspenders backup, but the web content
+route reads from the DB column first and only falls back to disk for
+legacy rows. This eliminates the 'DB and disk disagree' class of bugs
+that caused the Phase 5.0 content endpoint 500.
 """
 import re
 from datetime import datetime, timezone
@@ -66,8 +73,12 @@ class WriteBriefTool(Tool):
         filename = f"{ts}-{_slug(title)}.md"
         filepath = artifacts_dir / filename
 
+        # Still write to disk as a backup — the DB column is the authoritative
+        # source in Phase 5.0.1+, but the disk copy is a belt-and-suspenders
+        # safety net until we trust the DB-only path completely.
         filepath.write_text(content, encoding="utf-8")
         size = filepath.stat().st_size
+        content_bytes = len(content.encode("utf-8"))
 
         artifact_id = await insert_artifact(
             run_id=run_id,
@@ -77,6 +88,8 @@ class WriteBriefTool(Tool):
             mime_type="text/markdown",
             size=size,
             metadata={"filename": filename, "format": "markdown"},
+            content=content,
+            content_size=content_bytes,
         )
 
         return {
