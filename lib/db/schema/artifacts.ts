@@ -20,8 +20,14 @@ export const artifactKindEnum = pgEnum("artifact_kind", [
 
 /**
  * Files produced by a run — reports, generated images, CSVs, code, etc.
+ *
+ * Phase 5.0.1: `content` is the authoritative store for textual artifacts
+ * (markdown briefs, JSON reports, etc). The worker also writes to `path`
+ * on disk as a belt-and-suspenders backup, but the content route reads
+ * from `content` first and only falls back to `path` for legacy rows.
+ *
  * `path` is a local filesystem path on the Framestation (or an S3/MinIO URL
- * if we ever route through one).
+ * if we ever route through one). Kept NOT NULL for backwards compatibility.
  */
 export const artifacts = pgTable("artifacts", {
   id: uuid("id").defaultRandom().primaryKey(),
@@ -34,6 +40,9 @@ export const artifacts = pgTable("artifacts", {
   size: integer("size"),
   kind: artifactKindEnum("kind").notNull().default("other"),
   metadata: jsonb("metadata").$type<Record<string, unknown>>(),
+  // Phase 5.0.1 — content stored directly in DB for text artifacts
+  content: text("content"),
+  contentSize: integer("content_size"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
