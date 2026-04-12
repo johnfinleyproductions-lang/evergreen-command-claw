@@ -951,19 +951,21 @@ Phase 5.0.1 killed the entire bug class by moving artifact content into Postgres
 - [x] Merged via branch `phase-5.0.1-artifacts-in-db` → main
 - [x] Smoke test verified end-to-end: new artifact row showed `content_size=148` matching `LENGTH(content)=148`, content endpoint returned 200, preview rendered inline, no 500 error. Gotcha hit during rollout: worker was restarted before `git checkout` so it imported stale Python modules — second restart picked up the fix.
 
+### Phase 5.1 — Task create/edit/delete/run UI ✅
+- [x] `app/api/tasks/[id]/route.ts` — `GET` / `PATCH` / `DELETE` handlers for a single task. PATCH is a true partial update (fields absent from the body stay put, `null` clears nullable columns, empty body rejected). UUID shape is validated before touching the DB.
+- [x] `lib/prompt-template.ts` — shared `{{var}}` util exporting `extractTemplateVars(template)` and `renderPromptTemplate(template, vars)`. The run dialog uses it for live preview; `POST /api/runs` continues to use the same regex on the server side, so preview and execution can't drift.
+- [x] `app/tasks/page.tsx` — slimmed to a 27-line server component. Runs the Drizzle `select().from(tasks).orderBy(desc(updatedAt))` and hands the rows to `<TaskManager>` as `initialTasks`. Zero-JS first paint; no loading spinner.
+- [x] `app/tasks/task-manager.tsx` — client island that owns modal state (`none | new | edit | run`), the hydrated task list, the inline delete confirm, and error display. After every successful mutation it calls `router.refresh()` so the server component re-runs and the list reflects truth without manual splicing.
+- [x] `app/tasks/task-form-dialog.tsx` — one component, two modes (discriminated-union props: `mode="create"` takes no task, `mode="edit"` requires `task: Task`). Seven fields: `name*`, `description`, `prompt*`, `systemPrompt`, `toolsAllowed` (CSV), `tags` (CSV), `inputSchema` (raw JSON textarea, parsed on submit). `useEffect` reseeds state whenever the dialog reopens on a different task.
+- [x] `app/tasks/run-task-dialog.tsx` — parses `{{vars}}` out of the task's prompt via `useMemo`, renders one input per variable (or a "ready to fire" panel if there are none), shows a live rendered preview, and POSTs to `/api/runs` with `{taskId, inputVars}` → redirects to `/runs/[id]`.
+- [x] Merged via branch `phase-5.1-task-ui` → main (PR #1, squash merge)
+- [x] Smoke test verified end-to-end: create task with `{{vars}}`, edit task, run with live preview landing on `/runs/[id]`, delete with native confirm, no-var task runs via "ready to fire" path, validation errors fire without API call.
+
 ---
 
 ## What's Left To Do
 
-### Phase 5.1 — Task create/edit UI 🔴 (next)
-
-1. Form page for creating a new `task` row — `name`, `description`, `prompt_template`, `default_input` JSON editor
-2. Inline `{{var}}` detection in the template — auto-populate the default_input shape from the vars the template references
-3. Edit page for existing tasks (same form, prefilled, PATCH handler)
-4. Task list page links to a "run now" action that POSTs `/api/runs` with the task id
-5. Kills the current "hand-write JSON and POST via curl" workflow
-
-### Phase 5.2 — Rendered `final_answer` hero panel on run detail 🔴
+### Phase 5.2 — Rendered `final_answer` hero panel on run detail 🔴 (next)
 
 1. Run detail page gets a hero panel at the top that renders `output.final_answer` as proper markdown
 2. Also shows the last tool call's result inline during the ~5min Nemotron re-ingest gap so the UI doesn't look hung
@@ -1207,4 +1209,4 @@ npm run lint                          # ESLint
 
 ---
 
-*Last updated: 2026-04-11. Project state: **Phase 5.0.1 shipped** — artifact content now lives in the Postgres `artifacts.content` TEXT column instead of on disk, killing the Phase 5.0 content endpoint 500 that was caused by the web app and the worker disagreeing about filesystem state. `insert_artifact()` and `write_brief` populate `content` + `content_size` on every new row; `app/api/artifacts/[id]/content/route.ts` reads from the DB column first with a file-path fallback only for legacy rows. Smoke tested end-to-end: new artifact row `content_size=148` matching `LENGTH(content)=148`, content endpoint 200, preview renders inline. Current state of the full stack: Next.js 15 web app, Python worker with full LLM agent loop against llama.cpp + Nemotron 120B, four tools (`echo`, `web_search`, `fetch_url`, `write_brief`), SSE log streaming, token usage tracking, graduated budget awareness + final-turn tool strip, run detail page with inline artifact viewer. Next: Phase 5.1 (task create/edit UI) to kill the "hand-write JSON and POST via curl" workflow, then 5.2 (rendered final-answer hero panel), then 5.3 (worker crash recovery + heartbeat) and 5.4 (cooperative cancel). Phase 6.0 (second worker node + fast/slow model tiering) and Phase 6.1 (FileBrowser + Tailscale remote access with NCB as the warm-mirror secondary) are parked until the 5.x series is done.*
+*Last updated: 2026-04-11. Project state: **Phase 5.1 shipped** — the `/tasks` page is now a fully interactive CRUD surface. Create, edit, delete, and run tasks all happen in-place via modals; the task form covers the real seven-field schema (`name`, `description`, `prompt`, `systemPrompt`, `toolsAllowed[]`, `tags[]`, `inputSchema` as raw JSON); the run dialog parses `{{vars}}` out of the prompt, renders one input per variable, and shows a live rendered preview before firing. Backed by a new `PATCH`/`DELETE` handler at `app/api/tasks/[id]/route.ts` and a shared `{{var}}` util at `lib/prompt-template.ts` so the client preview and the server-side render in `POST /api/runs` can't drift. This kills the old "hand-write JSON and POST via curl" workflow. Current state of the full stack: Next.js 15 web app with interactive task CRUD, Python worker with full LLM agent loop against llama.cpp + Nemotron 120B, four tools (`echo`, `web_search`, `fetch_url`, `write_brief`), SSE log streaming, token usage tracking, graduated budget awareness + final-turn tool strip, run detail page with inline artifact viewer, artifact content stored in Postgres (Phase 5.0.1). Next: Phase 5.2 (rendered final-answer hero panel on run detail) to kill the apparent-hang during the ~5min Nemotron re-ingest gap, then 5.3 (worker crash recovery + heartbeat) and 5.4 (cooperative cancel). Phase 6.0 (second worker node + fast/slow model tiering) and Phase 6.1 (FileBrowser + Tailscale remote access with NCB as the warm-mirror secondary) are parked until the 5.x series is done.*

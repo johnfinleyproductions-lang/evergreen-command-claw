@@ -114,13 +114,16 @@ Four tables: `tasks`, `runs`, `run_logs`, `artifacts`. Plus two enums.
 
 ### `tasks`
 
-Saved, reusable prompts. Phase 5.1 will add the CRUD UI.
+Saved, reusable prompts. CRUD UI landed in Phase 5.1 — `/tasks` is a server component that hydrates a `<TaskManager>` client island with modals for create/edit/delete/run.
 
 - `id uuid PK default gen_random_uuid()`
 - `name text NOT NULL`
 - `description text`
-- `prompt_template text NOT NULL` — supports `{{var}}` substitution via `lib/prompt-template.ts`
-- `default_input jsonb` — default variable values
+- `prompt text NOT NULL` — supports `{{var}}` substitution via `lib/prompt-template.ts` (both client preview in the run dialog and server-side render in `POST /api/runs` use the same `extractTemplateVars` / `renderPromptTemplate` helpers)
+- `system_prompt text` — optional system prompt applied when the task is run
+- `tools_allowed text[] default '{}'` — allowlist of tool names the agent may call for this task (empty array = all tools allowed)
+- `input_schema jsonb` — optional JSON Schema for the input variables; edited as raw JSON in the form dialog
+- `tags text[] default '{}'` — free-form labels for the task list view
 - `created_at timestamp default now() NOT NULL`
 - `updated_at timestamp default now() NOT NULL`
 
@@ -540,7 +543,7 @@ Chronological record of what landed when, with the commit that landed it.
 | 4.5   | Graduated budget awareness + final-turn tool strip          | done      | `e45da02` |
 | 5.0   | Artifact viewer (list + preview)                            | shipped + hotfixed |  |
 | 5.0.1 | Artifact content in Postgres (`content TEXT` column)        | done      |           |
-| 5.1   | Task create/edit UI                                         | pending   |           |
+| 5.1   | Task create/edit/delete/run UI                              | done      | `4b59ed4` |
 | 5.2   | Rendered `final_answer` hero panel on run detail            | pending   |           |
 | 5.3   | Worker crash recovery + heartbeat                           | pending   |           |
 | 5.4   | Cooperative cancel wired through agent loop                 | pending   |           |
@@ -550,6 +553,8 @@ Chronological record of what landed when, with the commit that landed it.
 **Phase 4.5 validation note:** smoke test `dad085a1` succeeded at 10 iters / 9 tool calls / 74k tokens but did NOT trip the ≤5 or ≤2 budget thresholds. Test D (§12) still needs to run to confirm the budget mechanism actually fires under adversarial prompts.
 
 **Phase 5.0.1 shipped note:** the Phase 5.0 content endpoint 500 was caused by the web app and the worker having different views of `worker/artifacts/` on disk. We added `content TEXT` and `content_size INTEGER` columns to the `artifacts` table, taught `insert_artifact()` and `write_brief` to populate them, and rewrote `app/api/artifacts/[id]/content/route.ts` to read from the DB column first with the file path only as a legacy-row fallback. Smoke test: new artifact row showed `content_size=148` matching `LENGTH(content)=148`, content endpoint returned 200, preview rendered inline. Gotcha hit during rollout: the worker was restarted before `git checkout` so it imported the old Python code on disk — second restart picked up the fix. See §13 "Filesystem state between processes is a liability."
+
+**Phase 5.1 shipped note:** the `/tasks` page is now a fully interactive CRUD surface. Create/edit/delete/run all happen in-place via modals; the form covers the real seven-field schema (`name`, `description`, `prompt`, `systemPrompt`, `toolsAllowed[]`, `tags[]`, `inputSchema` as raw JSON); the run dialog parses `{{vars}}` from the prompt, renders one input per variable, and shows a live rendered preview before firing. Backed by a new `PATCH`/`DELETE` handler at `app/api/tasks/[id]/route.ts` (partial update: fields absent from the body stay put, `null` clears nullable columns, empty body rejected) and a shared `lib/prompt-template.ts` util so the client preview and the server-side render in `POST /api/runs` share the same regex. Server component + client island pattern: `app/tasks/page.tsx` stays a 27-line server component that queries Drizzle directly, `<TaskManager>` owns all modal state and calls `router.refresh()` after each mutation. Smoke tested end-to-end: create with `{{vars}}`, edit in place, run with live preview landing on `/runs/[id]`, delete with native `confirm()`, no-var task via "ready to fire" path, validation errors fire without API call. Commit `4b59ed4` via PR #1 squash merge. Note: ARCHITECTURE.md §3 `tasks` schema documentation had drift (old docs said `prompt_template` + `default_input`, real Drizzle schema has `prompt` + `system_prompt` + `tools_allowed[]` + `input_schema` + `tags[]`) — fixed in this same commit.
 
 ### Phase 6.1 block (parked — NCB / FileBrowser / remote access)
 
