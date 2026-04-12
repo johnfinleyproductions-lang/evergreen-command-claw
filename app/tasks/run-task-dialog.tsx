@@ -3,7 +3,7 @@
 // Phase 5.1 "Run this task" dialog. Given a task, it:
 //
 //   1. Parses {{vars}} out of the task's prompt via extractTemplateVars.
-//   2. Renders one input per variable (or a "ready to fire" panel if none).
+//   2. Renders one textarea per variable (or a "ready to fire" panel if none).
 //   3. Shows a live preview of the rendered prompt as the user types.
 //   4. POSTs to /api/runs with {taskId, inputVars} and redirects to
 //      /runs/[id] on success.
@@ -34,6 +34,21 @@ type Props = {
   task: Task;
   onClose: () => void;
 };
+
+/**
+ * Pull a human-readable hint for a template variable out of the task's
+ * JSON-Schema-shaped inputSchema column, if one exists.
+ */
+function getVarDescription(
+  inputSchema: unknown,
+  varName: string,
+): string | undefined {
+  if (!inputSchema || typeof inputSchema !== "object") return undefined;
+  const schema = inputSchema as {
+    properties?: Record<string, { description?: string } | undefined>;
+  };
+  return schema.properties?.[varName]?.description;
+}
 
 export function RunTaskDialog({ open, task, onClose }: Props) {
   const router = useRouter();
@@ -91,7 +106,7 @@ export function RunTaskDialog({ open, task, onClose }: Props) {
 
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="border-gray-800 bg-background">
+      <DialogContent className="border-gray-800 bg-background max-w-2xl">
         <DialogHeader className="border-gray-800 bg-surface/30">
           <DialogTitle className="text-text">Run: {task.name}</DialogTitle>
           <DialogDescription className="text-text-dim">
@@ -103,29 +118,36 @@ export function RunTaskDialog({ open, task, onClose }: Props) {
 
         <form
           onSubmit={handleSubmit}
-          className="overflow-y-auto px-5 py-4 space-y-4"
+          className="overflow-y-auto px-5 py-4 space-y-4 max-h-[65vh]"
           id="run-task-form"
         >
           {vars.length > 0 && (
-            <div className="space-y-3">
-              {vars.map((name) => (
-                <div key={name}>
-                  <label className="block text-sm font-medium text-text mb-1 font-mono">
-                    {`{{${name}}}`}
-                  </label>
-                  <input
-                    type="text"
-                    value={values[name] ?? ""}
-                    onChange={(e) =>
-                      setValues((prev) => ({
-                        ...prev,
-                        [name]: e.target.value,
-                      }))
-                    }
-                    className="w-full px-3 py-2 bg-gray-900 border border-gray-800 rounded-md text-text text-sm focus:outline-none focus:border-emerald-600"
-                  />
-                </div>
-              ))}
+            <div className="space-y-4">
+              {vars.map((name) => {
+                const hint = getVarDescription(task.inputSchema, name);
+                return (
+                  <div key={name}>
+                    <label className="block text-sm font-medium text-text mb-1 font-mono">
+                      {`{{${name}}}`}
+                    </label>
+                    {hint && (
+                      <p className="text-xs text-text-dim mb-2">{hint}</p>
+                    )}
+                    <textarea
+                      value={values[name] ?? ""}
+                      onChange={(e) =>
+                        setValues((prev) => ({
+                          ...prev,
+                          [name]: e.target.value,
+                        }))
+                      }
+                      rows={4}
+                      placeholder={hint ?? `Value for {{${name}}}…`}
+                      className="w-full px-3 py-2 bg-gray-900 border border-gray-800 rounded-md text-text text-sm font-mono focus:outline-none focus:border-emerald-600 resize-y"
+                    />
+                  </div>
+                );
+              })}
             </div>
           )}
 
