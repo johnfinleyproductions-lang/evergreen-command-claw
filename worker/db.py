@@ -214,14 +214,26 @@ async def insert_artifact(
     mime_type: Optional[str] = None,
     size: Optional[int] = None,
     metadata: Optional[dict] = None,
+    content: Optional[str] = None,
+    content_size: Optional[int] = None,
 ) -> UUID:
-    """Insert an artifact row. `kind` must be report|data|image|code|log|other."""
+    """Insert an artifact row. `kind` must be report|data|image|code|log|other.
+
+    Phase 5.0.1: accepts `content` (the authoritative text body) and
+    `content_size` (byte length) so text artifacts can be read back from
+    Postgres without touching disk. `path` is still required for
+    backwards compatibility — write_brief continues to write a disk
+    backup as belt-and-suspenders until we're confident in DB-only.
+    """
     assert _pool is not None
     async with _pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO artifacts (run_id, name, path, kind, mime_type, size, metadata)
-            VALUES ($1, $2, $3, $4::artifact_kind, $5, $6, $7)
+            INSERT INTO artifacts (
+                run_id, name, path, kind, mime_type, size, metadata,
+                content, content_size
+            )
+            VALUES ($1, $2, $3, $4::artifact_kind, $5, $6, $7, $8, $9)
             RETURNING id
             """,
             run_id,
@@ -231,6 +243,8 @@ async def insert_artifact(
             mime_type,
             size,
             metadata,
+            content,
+            content_size,
         )
         return row["id"]
 
