@@ -1,4 +1,4 @@
-"""Agent loop \u2014 Phase 3B.
+"""Agent loop — Phase 3B.
 
 Given a prompt, builds a messages list, asks the LLM to plan + call tools,
 dispatches the tool calls through the registry, feeds the results back, and
@@ -7,6 +7,12 @@ or hits AGENT_MAX_ITERATIONS.
 
 Returns a dict with `output` (destined for runs.output) plus aggregated token
 usage so the caller can update runs.model / runs.*_tokens.
+
+Phase 5.4: at the top of each iteration, checks `is_cancelled(run_id)`. If
+the run has been flipped to 'cancelled' by POST /api/runs/[id]/cancel, the
+loop breaks and returns an output dict with `cancelled=true`. execute_run
+dispatches that to finalize_run_cancelled, which records the partial progress
+without clobbering the cancelled status.
 """
 from __future__ import annotations
 
@@ -17,7 +23,13 @@ from typing import Any, Optional
 from uuid import UUID
 
 from config import config
-from db import complete_tool_call, fail_tool_call, insert_tool_call, write_log
+from db import (
+    complete_tool_call,
+    fail_tool_call,
+    insert_tool_call,
+    is_cancelled,
+    write_log,
+)
 from llm import make_client
 from tools.registry import registry
 
@@ -26,12 +38,12 @@ log = logging.getLogger(__name__)
 
 DEFAULT_SYSTEM_PROMPT = """You are Evergreen Command, a local AI task runner running on a private GPU server.
 
-You have access to a set of tools provided to you via the function-calling interface. Use them to gather real information and produce real deliverables. Never fabricate tool results \u2014 always call the tool.
+You have access to a set of tools provided to you via the function-calling interface. Use them to gather real information and produce real deliverables. Never fabricate tool results — always call the tool.
 
 Guidelines:
 - For research tasks, use `web_search` to find relevant pages, then `fetch_url` to read the ones that look promising.
 - For written deliverables (briefs, reports, summaries), use `write_brief` to save the final document to disk as an artifact.
-- Be efficient: don't call tools you don't need. 3\u20136 tool calls is usually enough for a research brief.
+- Be efficient: don't call tools you don't need. 3–6 tool calls is usually enough for a research brief.
 - Keep your running context lean: you have a limited context window. Don't re-fetch pages you've already read, and don't run duplicate searches.
 - When the task is complete, reply with a short plain-text summary of what you did and where to find any artifacts you saved. Do NOT call any tool in your final message.
 """
@@ -68,6 +80,10 @@ async def run_agent(
             "completion_tokens": int,
             "total_tokens": int,
         }
+
+    The output dict carries an "error" key for max-iterations cases and a
+    "cancelled" key for cooperative-cancel cases. execute_run inspects both
+    to route to finalize_run_failure / finalize_run_cancelled respectively.
     """
     messages: list[dict] = [
         {"role": "system", "content": system or DEFAULT_SYSTEM_PROMPT},
@@ -91,10 +107,29 @@ async def run_agent(
     total_total_tokens = 0
     last_model: Optional[str] = None
     hit_max = False
+    cancelled = False
     final_answer: Optional[str] = None
+    iteration = 0  # initialize so the output dict has a value even if the loop never runs
 
     async with make_client() as llm:
         for iteration in range(config.AGENT_MAX_ITERATIONS):
+            # Phase 5.4: cooperative cancel check. Runs before any LLM call
+            # or tool dispatch this iteration. Worst case the user waits one
+            # in-flight LLM turn (up to ~60s) before the cancel lands.
+            if await is_cancelled(run_id):
+                await write_log(
+                    run_id,
+                    "info",
+                    f"cancellation detected at iteration {iteration + 1}; stopping agent loop",
+                    {
+                        "iteration": iteration + 1,
+                        "iterations_completed": iteration,
+                        "tool_calls_made": sequence,
+                    },
+                )
+                cancelled = True
+                break
+
             ctx_chars, ctx_tokens_est = _estimate_context_size(messages)
             await write_log(
                 run_id,
@@ -183,7 +218,7 @@ async def run_agent(
             messages.append(assistant_append)
 
             if not tool_calls:
-                # Final answer \u2014 we're done
+                # Final answer — we're done
                 final_answer = content
                 await write_log(
                     run_id,
@@ -267,7 +302,7 @@ async def run_agent(
 
                 sequence += 1
         else:
-            # Loop fell through without break \u2014 hit max iterations
+            # Loop fell through without break — hit max iterations
             hit_max = True
             await write_log(
                 run_id,
@@ -276,15 +311,30 @@ async def run_agent(
                 {"max_iterations": config.AGENT_MAX_ITERATIONS},
             )
 
-    output = {
-        "final_answer": final_answer
-        or "[agent hit max iterations without a final answer]",
-        "iterations": iteration + 1,
-        "message_count": len(messages),
-        "tool_calls_made": sequence,
-    }
-    if hit_max:
-        output["error"] = "max_iterations_exceeded"
+    # --- build output based on terminal condition ---
+    # Three terminal conditions: cancelled (Phase 5.4), hit_max (Phase 4.5),
+    # or clean break with final_answer.
+    if cancelled:
+        # iterations = fully-completed iteration count. We break at the top
+        # of the next iteration before doing work, so `iteration` (the loop
+        # index when break fired) equals the number of iterations completed.
+        output: dict[str, Any] = {
+            "cancelled": True,
+            "final_answer": None,
+            "iterations": iteration,
+            "message_count": len(messages),
+            "tool_calls_made": sequence,
+        }
+    else:
+        output = {
+            "final_answer": final_answer
+            or "[agent hit max iterations without a final answer]",
+            "iterations": iteration + 1,
+            "message_count": len(messages),
+            "tool_calls_made": sequence,
+        }
+        if hit_max:
+            output["error"] = "max_iterations_exceeded"
 
     return {
         "output": output,
