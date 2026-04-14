@@ -240,6 +240,98 @@ page, stale-token holdouts, and the one gap in discoverability.
     you want to keep the run open while firing another one from the
     same tab.
 
+---
+
+## Round 4 — Business profiles (Phase 5.4.2, same branch, same PR)
+
+Goal: give every run a reusable context layer — drop a Markdown /
+text file on `/profiles`, flip it active, and its contents
+auto-prepend to every new run's prompt. No more pasting the same
+"you are working on business X, tone is Y, constraints are Z"
+preamble into every template.
+
+### Data model
+- **`drizzle/0003_phase_5_4_2_profiles.sql`** — new `profiles` table
+  (`id uuid`, `name text`, `content text default ''`, `is_active bool`,
+  `created_at / updated_at`). Single-active-row invariant enforced by
+  a partial unique index:
+  ```sql
+  CREATE UNIQUE INDEX profiles_single_active_idx
+    ON profiles ((1)) WHERE is_active = true;
+  ```
+  Postgres guarantees at most one `is_active = true` row across
+  concurrent writers — no CHECK + trigger contraption needed. The
+  activate route wraps a two-statement swap in a transaction so the
+  constraint never trips mid-flight.
+- **`lib/db/schema/profiles.ts`** — matching Drizzle schema, exported
+  from `lib/db/schema/index.ts`.
+
+### API
+- **`GET/POST /api/profiles`** — list (active first, then by
+  `updated_at desc`) / create. `POST` accepts
+  `{ name, content, activate? }`; when `activate: true` the route
+  deactivates any existing active row in the same transaction.
+- **`GET/PATCH/DELETE /api/profiles/:id`** — partial-update pattern
+  mirroring the tasks route. 256KB content cap enforced on write via
+  `Buffer.byteLength(content, "utf8")`.
+- **`POST /api/profiles/:id/activate`** — atomic transactional swap:
+  deactivate others, activate target, return the activated row.
+- **`GET /api/profiles/active`** — fastpath returning
+  `{ profile: row | null }`. Used by both the top-nav switcher and
+  the new-run form chip to avoid paging the full list.
+
+### Server-side prompt injection
+- **`app/api/runs/route.ts`** — single source of truth for blending
+  profile context into every new run. Before the prompt gets handed
+  to the worker, the route:
+  1. Loads the active profile (if any, and if client didn't pass
+     `skipProfile: true`).
+  2. Prepends `## Context: {name}\n\n{content}\n\n---\n\n` to the
+     final prompt.
+  3. Writes an `input.profile = { id, name }` breadcrumb onto
+     `runs.input` JSONB so every run records which profile rode
+     along.
+  The client never sees the blended prompt — this means retries and
+  re-runs from the UI can't double-prepend, and the profile switcher
+  can change underneath you without corrupting history.
+
+### UI
+- **`app/profiles/page.tsx`** — server component, one query, hands
+  off to a client manager. Matches the chrome of `/runs` and
+  `/tasks`.
+- **`app/profiles/profiles-manager.tsx`** — client island with a
+  drag-drop zone (accepts `.md / .markdown / .txt / .json / text/*`),
+  inline name + content editor, per-row activate / deactivate /
+  delete, and an auto-activate-first-upload branch for the zero
+  state so new users get value on drop #1. `stripExtension()`
+  helper drops the file extension for the default name.
+- **`app/profiles/loading.tsx` + `app/profiles/error.tsx`** — chrome-
+  matching skeleton + error boundary, consistent with every other
+  route.
+- **`components/profile-switcher.tsx`** — top-nav DropdownMenu.
+  Collapses to a dashed "Add context" link in the zero state. Polls
+  `/api/profiles` on mount and after mutations so activation / delete
+  elsewhere reflects immediately. Mounted before `<HealthIndicator />`
+  in `components/top-nav.tsx`.
+- **`components/top-nav.tsx`** — added `/profiles` nav link +
+  `<ProfileSwitcher />` mount.
+- **`app/runs/new/new-run-form.tsx`** — when an active profile
+  exists, shows a primary-tinted Card chip ("Running with context:
+  {name}") that links to `/profiles`. Fetches `/api/profiles/active`
+  on mount; client never needs to touch the content itself.
+
+### Design invariants
+- **One writer for prompt blending.** The API route owns injection;
+  no client path ever blends. This keeps retries, re-runs, and the
+  `?prompt=...` deep link all correct with zero duplicated context.
+- **Traceability.** `runs.input.profile = { id, name }` means any
+  historical run can be traced back to the exact profile that shaped
+  its response, even after the profile is renamed or deleted.
+- **Graceful zero state.** Empty `/profiles` still renders a working
+  drop zone; top-nav switcher collapses to "Add context"; new-run
+  form simply omits the chip. Every page works with no profiles at
+  all.
+
 ## What's still next
 
 - **Server-side filtering** at scale (> 100 runs) — the client-side
@@ -250,8 +342,11 @@ page, stale-token holdouts, and the one gap in discoverability.
   persisting the last N ad-hoc prompts in localStorage (or a small
   `prompt_history` table) is the obvious follow-on.
 - **Keyboard palette coverage** — extend `keyboard-shortcuts.tsx` with
-  `g t` → `/tasks` and a `.` / `/` to focus the palette input without
-  the `⌘` modifier.
+  `g t` → `/tasks`, `g p` → `/profiles`, and a `.` / `/` to focus the
+  palette input without the `⌘` modifier.
 - **System health indicator** — small dot in the TopNav that polls
   `/api/health` (or reuses `/api/runs?limit=1` as a DB liveness
   signal) and toasts on degradation.
+- **Profile filtering on `/runs`** — the `input.profile` breadcrumb is
+  already written; add a chip to the RunsBrowser so "show me every
+  run that used profile X" is one click.
