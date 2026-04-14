@@ -5,6 +5,8 @@
 // Phase 5.0 — Added right-rail <ArtifactPanel /> (client component, polls
 // while run is non-terminal). Layout expanded from max-w-5xl single column
 // to max-w-7xl flex with lg:w-80 right rail.
+// Phase 5.2 — Promote run.output.final_answer to a hero panel above logs.
+// When present, the raw JSON output is demoted to a collapsed <details>.
 
 import { eq } from "drizzle-orm";
 import { notFound } from "next/navigation";
@@ -12,6 +14,7 @@ import { db } from "@/lib/db/client";
 import { runs } from "@/lib/db/schema";
 import { RunLogPanel } from "./run-log-panel";
 import { ArtifactPanel } from "./artifact-panel";
+import { FinalAnswerPanel, extractFinalAnswer } from "./final-answer-panel";
 
 export const dynamic = "force-dynamic";
 
@@ -56,6 +59,8 @@ export default async function RunDetailPage({
       ? Math.max(0, (run.finishedAt.getTime() - run.startedAt.getTime()) / 1000)
       : null;
 
+  const finalAnswer = extractFinalAnswer(run.output);
+
   return (
     <main className="mx-auto max-w-7xl p-6 md:p-10">
       <header className="mb-8">
@@ -82,6 +87,10 @@ export default async function RunDetailPage({
 
       <div className="flex flex-col lg:flex-row gap-6">
         <div className="flex-1 min-w-0 space-y-6">
+          {finalAnswer && (
+            <FinalAnswerPanel finalAnswer={finalAnswer} runId={run.id} />
+          )}
+
           {run.input != null && (
             <section>
               <h2 className="text-sm font-medium mb-2 text-muted-foreground">
@@ -111,12 +120,28 @@ export default async function RunDetailPage({
 
           {run.output != null && (
             <section>
-              <h2 className="text-sm font-medium mb-2 text-muted-foreground">
-                Output
-              </h2>
-              <pre className="bg-muted/40 border rounded-md p-3 text-xs overflow-auto max-h-96">
-                {JSON.stringify(run.output, null, 2)}
-              </pre>
+              {finalAnswer ? (
+                <details className="group">
+                  <summary className="text-sm font-medium mb-2 text-muted-foreground cursor-pointer list-none flex items-center gap-2 hover:text-foreground transition-colors">
+                    <span className="inline-block w-3 text-xs transition-transform group-open:rotate-90">
+                      ▸
+                    </span>
+                    Raw output (JSON)
+                  </summary>
+                  <pre className="mt-2 bg-muted/40 border rounded-md p-3 text-xs overflow-auto max-h-96">
+                    {JSON.stringify(run.output, null, 2)}
+                  </pre>
+                </details>
+              ) : (
+                <>
+                  <h2 className="text-sm font-medium mb-2 text-muted-foreground">
+                    Output
+                  </h2>
+                  <pre className="bg-muted/40 border rounded-md p-3 text-xs overflow-auto max-h-96">
+                    {JSON.stringify(run.output, null, 2)}
+                  </pre>
+                </>
+              )}
             </section>
           )}
         </div>
