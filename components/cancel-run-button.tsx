@@ -1,18 +1,10 @@
 // components/cancel-run-button.tsx
 //
 // Phase 5.4.1 — UI cancel button. Shipped on the run detail page header.
+// Phase 5.4.1 (round 2) — toast feedback.
 //
-// Design:
-//   - Only renders when status ∈ {pending, running}.
-//   - On click: POST /api/runs/[id]/cancel, show optimistic "Cancelling…".
-//   - Because backend cancel is cooperative (one LLM turn of latency), we
-//     do NOT flip the UI straight to 'cancelled' — we show the pending state
-//     and let router.refresh() + artifact-panel polling do the reveal.
-//   - 409 response = already terminal (race with worker); we still refresh.
-//   - 404/400/500 → inline error, button re-enabled for a retry.
-//
-// The ARCHITECTURE.md §4 ownership contract is preserved: this button
-// never touches runs.status directly — the API route owns that transition.
+// Ownership contract: this button never touches runs.status directly —
+// the API route owns that transition (see ARCHITECTURE.md §4).
 
 "use client";
 
@@ -20,6 +12,7 @@ import * as React from "react";
 import { useRouter } from "next/navigation";
 import { XCircle, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { toast } from "@/lib/hooks/use-toast";
 import { cn } from "@/lib/utils/cn";
 
 type Props = {
@@ -41,22 +34,37 @@ export function CancelRunButton({ runId, status, className }: Props) {
     setError(null);
     setPending(true);
     try {
-      const res = await fetch(`/api/runs/${runId}/cancel`, {
-        method: "POST",
-      });
-      if (!res.ok && res.status !== 409) {
+      const res = await fetch(`/api/runs/${runId}/cancel`, { method: "POST" });
+
+      if (res.status === 200) {
+        toast({
+          title: "Cancel requested",
+          description:
+            "Worker will observe the cancel within one LLM turn.",
+          variant: "success",
+        });
+      } else if (res.status === 409) {
+        toast({
+          title: "Run already finished",
+          description: "Nothing to cancel — status is already terminal.",
+          variant: "warning",
+        });
+      } else {
         const body = await res.json().catch(() => ({ error: res.statusText }));
         throw new Error(body.error ?? `HTTP ${res.status}`);
       }
-      // 200 = flipped to cancelled, 409 = already terminal. Either way,
-      // server state has moved on — refresh the page to pick it up.
+
       router.refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Cancel failed");
+      const msg = err instanceof Error ? err.message : "Cancel failed";
+      setError(msg);
+      toast({
+        title: "Cancel failed",
+        description: msg,
+        variant: "destructive",
+      });
       setPending(false);
     }
-    // Note: we leave `pending` true on success so the button stays disabled
-    // until the refresh swaps it out (CANCELLABLE check above).
   };
 
   return (
@@ -81,9 +89,7 @@ export function CancelRunButton({ runId, status, className }: Props) {
           </>
         )}
       </Button>
-      {error && (
-        <span className="text-[11px] text-destructive">{error}</span>
-      )}
+      {error && <span className="text-[11px] text-destructive">{error}</span>}
     </div>
   );
 }

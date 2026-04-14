@@ -1,7 +1,9 @@
 // app/runs/new/new-run-form.tsx
 //
-// Phase 5.4.1 — rebuilt on shadcn primitives (Button, Textarea, Label,
-// Card, Badge). Native select is styled to match Input.
+// Phase 5.4.1 — rebuilt on shadcn primitives.
+// Phase 5.4.1 (round 2) — accepts an initialPrompt for one-click re-run:
+// if ?prompt= is set, the form opens in Custom mode with the textarea
+// pre-filled. Errors also fire a toast in addition to the inline Card.
 
 "use client";
 
@@ -15,15 +17,17 @@ import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { toast } from "@/lib/hooks/use-toast";
 
 type Mode = "template" | "custom";
 
 type Props = {
   tasks: Task[];
   initialTaskId?: string;
+  initialPrompt?: string;
 };
 
-export function NewRunForm({ tasks, initialTaskId }: Props) {
+export function NewRunForm({ tasks, initialTaskId, initialPrompt }: Props) {
   const router = useRouter();
 
   const hasTemplates = tasks.length > 0;
@@ -32,9 +36,16 @@ export function NewRunForm({ tasks, initialTaskId }: Props) {
       ? initialTaskId
       : (tasks[0]?.id ?? "");
 
-  const [mode, setMode] = useState<Mode>(hasTemplates ? "template" : "custom");
+  const initialMode: Mode =
+    initialPrompt && initialPrompt.length > 0
+      ? "custom"
+      : hasTemplates
+        ? "template"
+        : "custom";
+
+  const [mode, setMode] = useState<Mode>(initialMode);
   const [selectedTaskId, setSelectedTaskId] = useState<string>(preselected);
-  const [customPrompt, setCustomPrompt] = useState("");
+  const [customPrompt, setCustomPrompt] = useState(initialPrompt ?? "");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -68,16 +79,18 @@ export function NewRunForm({ tasks, initialTaskId }: Props) {
       }
 
       const { run } = (await res.json()) as { run: { id: string } };
+      toast({ title: "Run fired", variant: "success" });
       router.push(`/runs/${run.id}`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to create run");
+      const msg = err instanceof Error ? err.message : "Failed to create run";
+      setError(msg);
+      toast({ title: "Run failed to start", description: msg, variant: "destructive" });
       setSubmitting(false);
     }
   };
 
   return (
     <form onSubmit={handleSubmit} className="space-y-6">
-      {/* Segmented mode toggle */}
       <div className="inline-flex items-center rounded-lg border border-border bg-secondary/40 p-1">
         <button
           type="button"

@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import { TopNav } from "@/components/top-nav";
+import { Toaster } from "@/components/ui/toaster";
 
 export const metadata: Metadata = {
   title: "Evergreen Command",
@@ -29,6 +30,7 @@ export default function RootLayout({
       <body className="antialiased bg-background text-foreground min-h-screen">
         <TopNav />
         <div id="main-content">{children}</div>
+        <Toaster />
       </body>
     </html>
   );

@@ -1,4 +1,7 @@
 // app/runs/new/page.tsx
+//
+// Phase 5.4.1 — accepts ?taskId= and ?prompt= for one-click re-run from
+// the run detail RunActionsMenu.
 
 import { desc } from "drizzle-orm";
 import { db } from "@/lib/db/client";
@@ -10,9 +13,9 @@ export const dynamic = "force-dynamic";
 export default async function NewRunPage({
   searchParams,
 }: {
-  searchParams: Promise<{ taskId?: string }>;
+  searchParams: Promise<{ taskId?: string; prompt?: string }>;
 }) {
-  const { taskId } = await searchParams;
+  const { taskId, prompt } = await searchParams;
   const allTasks = await db
     .select()
     .from(tasks)
@@ -26,7 +29,11 @@ export default async function NewRunPage({
           Pick a task template or write a free-form prompt.
         </p>
       </header>
-      <NewRunForm tasks={allTasks} initialTaskId={taskId} />
+      <NewRunForm
+        tasks={allTasks}
+        initialTaskId={taskId}
+        initialPrompt={prompt}
+      />
     </main>
   );
 }

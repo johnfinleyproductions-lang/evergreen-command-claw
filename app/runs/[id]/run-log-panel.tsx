@@ -3,10 +3,13 @@
 // Client component with smart auto-scroll. Sticks to the bottom while new
 // logs arrive unless the user has scrolled up.
 // Phase 5.4.1 — wrapped in Card, status pill refactored onto shared palette.
+// Phase 5.4.1 (round 2) — fires router.refresh() once on SSE termination,
+// so the run detail page auto-updates when the run naturally completes.
 
 "use client";
 
 import { useEffect, useRef } from "react";
+import { useRouter } from "next/navigation";
 import { useRunLogs, type LogLevel } from "@/lib/hooks/use-run-logs";
 import { cn } from "@/lib/utils/cn";
 
@@ -65,10 +68,13 @@ function StreamStatus({
 }
 
 export function RunLogPanel({ runId }: { runId: string }) {
+  const router = useRouter();
   const { logs, status, error, finalRunStatus } = useRunLogs(runId);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
+  const refreshedRef = useRef(false);
 
+  // Auto-scroll
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -76,6 +82,18 @@ export function RunLogPanel({ runId }: { runId: string }) {
       el.scrollTop = el.scrollHeight;
     }
   }, [logs]);
+
+  // Fire router.refresh() exactly once when the run terminates, so the
+  // server component re-reads status/output/error without an F5.
+  useEffect(() => {
+    if (refreshedRef.current) return;
+    if (!finalRunStatus) return;
+    if (finalRunStatus === "pending" || finalRunStatus === "running") return;
+    refreshedRef.current = true;
+    // Tiny debounce so the last log row paints before the server refetch.
+    const t = window.setTimeout(() => router.refresh(), 300);
+    return () => window.clearTimeout(t);
+  }, [finalRunStatus, router]);
 
   const handleScroll = () => {
     const el = scrollRef.current;

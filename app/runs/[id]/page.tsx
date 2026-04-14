@@ -1,11 +1,9 @@
 // app/runs/[id]/page.tsx
 //
-// Phase 3C — Run detail page. Server component that loads the run by id
-// and mounts <RunLogPanel /> which streams logs via SSE.
-// Phase 5.0 — Added right-rail <ArtifactPanel /> (client component, polls
-// while run is non-terminal).
+// Phase 3C — Run detail page.
+// Phase 5.0 — Added right-rail <ArtifactPanel />.
 // Phase 5.4.1 — UI pass: shadcn primitives, canonical RunStatusBadge,
-// CancelRunButton wired into the header.
+// CancelRunButton + RunActionsMenu wired into the header.
 
 import { eq } from "drizzle-orm";
 import { notFound } from "next/navigation";
@@ -15,6 +13,7 @@ import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { RunStatusBadge } from "@/components/run-status-badge";
 import { CancelRunButton } from "@/components/cancel-run-button";
+import { RunActionsMenu } from "@/components/run-actions-menu";
 import { formatDuration, formatRelativeTime } from "@/lib/utils/time";
 import { RunLogPanel } from "./run-log-panel";
 import { ArtifactPanel } from "./artifact-panel";
@@ -39,6 +38,19 @@ export default async function RunDetailPage({
   const durationSec =
     run.startedAt && run.finishedAt
       ? Math.max(0, (run.finishedAt.getTime() - run.startedAt.getTime()) / 1000)
+      : null;
+
+  const input = (run.input ?? {}) as {
+    prompt?: unknown;
+    taskId?: unknown;
+  };
+  const runPrompt =
+    typeof input.prompt === "string" && input.prompt.length > 0
+      ? input.prompt
+      : null;
+  const runTaskId =
+    typeof input.taskId === "string" && input.taskId.length > 0
+      ? input.taskId
       : null;
 
   return (
@@ -74,7 +86,14 @@ export default async function RunDetailPage({
               </Badge>
             </div>
           </div>
-          <CancelRunButton runId={run.id} status={run.status} />
+          <div className="flex items-start gap-2 shrink-0">
+            <CancelRunButton runId={run.id} status={run.status} />
+            <RunActionsMenu
+              runId={run.id}
+              prompt={runPrompt}
+              taskId={runTaskId}
+            />
+          </div>
         </div>
       </header>
 
