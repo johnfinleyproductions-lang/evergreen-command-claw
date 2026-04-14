@@ -1,4 +1,4 @@
-"""Evergreen Command worker — Phase 3B + 5.3.
+"""Evergreen Command worker — Phase 3B + 5.3 + 5.4.
 
 Polls the `runs` table for pending work, claims one row at a time, and
 branches on the shape of run.input:
@@ -13,6 +13,14 @@ Phase 5.3 additions:
 - While a run is executing, a background heartbeat task bumps
   runs.last_heartbeat every HEARTBEAT_INTERVAL_SECONDS so the next
   sweep can identify crashed workers.
+
+Phase 5.4 additions:
+- run_agent checks is_cancelled at the top of each iteration.
+  If the cancel endpoint has flipped the row, it returns with
+  output.cancelled=true. execute_run routes that to finalize_run_cancelled
+  which preserves the cancelled status and records partial progress.
+- _execute_literal_tool_calls checks is_cancelled between dispatches so
+  literal runs are also cancellable.
 
 Run:
     python main.py
@@ -36,9 +44,11 @@ from db import (
     close_pool,
     complete_tool_call,
     fail_tool_call,
+    finalize_run_cancelled,
     finalize_run_failure,
     finalize_run_success,
     insert_tool_call,
+    is_cancelled,
     open_pool,
     sweep_stale_runs,
     update_heartbeat,
@@ -75,7 +85,12 @@ def _request_shutdown(*_: Any) -> None:
 async def _execute_literal_tool_calls(
     run_id: UUID, tool_calls: list[dict]
 ) -> None:
-    """Dispatch a hardcoded list of tool calls. No LLM involvement."""
+    """Dispatch a hardcoded list of tool calls. No LLM involvement.
+
+    Phase 5.4: checks is_cancelled between dispatches. If the run was
+    cancelled mid-sequence, records partial tool_results on the
+    cancelled row instead of finalizing to success.
+    """
     if not tool_calls:
         msg = "run.input.tool_calls is empty"
         log.warning("%s: %s", run_id, msg)
@@ -86,6 +101,29 @@ async def _execute_literal_tool_calls(
     results: list[dict] = []
 
     for seq, call in enumerate(tool_calls):
+        # Phase 5.4: cooperative cancel check between tool dispatches.
+        if await is_cancelled(run_id):
+            await write_log(
+                run_id,
+                "info",
+                f"cancellation detected before literal tool call {seq}; stopping",
+                {
+                    "sequence": seq,
+                    "tool_calls_completed": len(results),
+                    "tool_calls_remaining": len(tool_calls) - seq,
+                },
+            )
+            await finalize_run_cancelled(
+                run_id,
+                {
+                    "cancelled": True,
+                    "tool_results": results,
+                    "tool_calls_completed": len(results),
+                    "tool_calls_remaining": len(tool_calls) - seq,
+                },
+            )
+            return
+
         name = call.get("name")
         arguments = call.get("arguments", {}) or {}
 
@@ -159,51 +197,75 @@ async def execute_run(run: asyncpg.Record) -> None:
             result = await run_agent(run_id, prompt, system=system)
             agent_output = result["output"]
 
-            # Always persist the output + token usage first so the UI has the
-            # trace even on failure paths.
-            await finalize_run_success(
-                run_id,
-                agent_output,
-                model=result.get("model"),
-                prompt_tokens=result.get("prompt_tokens"),
-                completion_tokens=result.get("completion_tokens"),
-                total_tokens=result.get("total_tokens"),
-            )
-
-            # If the agent hit its iteration ceiling without converging, flip
-            # the run to failed. finalize_run_failure only updates status /
-            # error_message / finished_at — the output jsonb is preserved.
-            if agent_output.get("error") == "max_iterations_exceeded":
-                await finalize_run_failure(
-                    run_id,
-                    "Agent hit max iterations without converging on a final answer",
-                )
+            # Phase 5.4: cancelled branch runs FIRST and short-circuits.
+            # finalize_run_cancelled guards on status='cancelled' so a late
+            # worker write can't resurrect the row.
+            if agent_output.get("cancelled"):
+                await finalize_run_cancelled(run_id, agent_output)
                 await write_log(
                     run_id,
-                    "warn",
-                    "run marked failed: max iterations exceeded",
+                    "info",
+                    "run cancelled (agent mode)",
                     {
                         "iterations": agent_output.get("iterations"),
                         "tool_calls_made": agent_output.get("tool_calls_made"),
+                        "total_tokens": result.get("total_tokens"),
                     },
                 )
-            await write_log(
-                run_id,
-                "info",
-                "run succeeded (agent mode)",
-                {
-                    "iterations": result["output"].get("iterations"),
-                    "tool_calls_made": result["output"].get("tool_calls_made"),
-                    "total_tokens": result.get("total_tokens"),
-                },
-            )
-            log.info(
-                "run %s succeeded via agent (%s iter, %s tool calls, %s tokens)",
-                run_id,
-                result["output"].get("iterations"),
-                result["output"].get("tool_calls_made"),
-                result.get("total_tokens"),
-            )
+                log.info(
+                    "run %s cancelled via agent (%s iter completed, %s tool calls)",
+                    run_id,
+                    agent_output.get("iterations"),
+                    agent_output.get("tool_calls_made"),
+                )
+            else:
+                # Always persist the output + token usage first so the UI has the
+                # trace even on failure paths. finalize_run_success now guards on
+                # `status != 'cancelled'` so a cancel POST that raced us doesn't
+                # get clobbered here either.
+                await finalize_run_success(
+                    run_id,
+                    agent_output,
+                    model=result.get("model"),
+                    prompt_tokens=result.get("prompt_tokens"),
+                    completion_tokens=result.get("completion_tokens"),
+                    total_tokens=result.get("total_tokens"),
+                )
+
+                # If the agent hit its iteration ceiling without converging, flip
+                # the run to failed. finalize_run_failure only updates status /
+                # error_message / finished_at — the output jsonb is preserved.
+                if agent_output.get("error") == "max_iterations_exceeded":
+                    await finalize_run_failure(
+                        run_id,
+                        "Agent hit max iterations without converging on a final answer",
+                    )
+                    await write_log(
+                        run_id,
+                        "warn",
+                        "run marked failed: max iterations exceeded",
+                        {
+                            "iterations": agent_output.get("iterations"),
+                            "tool_calls_made": agent_output.get("tool_calls_made"),
+                        },
+                    )
+                await write_log(
+                    run_id,
+                    "info",
+                    "run succeeded (agent mode)",
+                    {
+                        "iterations": agent_output.get("iterations"),
+                        "tool_calls_made": agent_output.get("tool_calls_made"),
+                        "total_tokens": result.get("total_tokens"),
+                    },
+                )
+                log.info(
+                    "run %s succeeded via agent (%s iter, %s tool calls, %s tokens)",
+                    run_id,
+                    agent_output.get("iterations"),
+                    agent_output.get("tool_calls_made"),
+                    result.get("total_tokens"),
+                )
 
         elif "tool_calls" in input_data:
             # --- Phase 3A: literal mode (kept for regression) ---
