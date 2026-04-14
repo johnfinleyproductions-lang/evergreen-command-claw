@@ -39,6 +39,11 @@ export const runs = pgTable("runs", {
   tokensPerSec: real("tokens_per_sec"),
   startedAt: timestamp("started_at"),
   finishedAt: timestamp("finished_at"),
+  // Phase 5.3 — updated by the worker every HEARTBEAT_INTERVAL_SECONDS
+  // while a run is in status='running'. A crash-recovery sweep on worker
+  // startup flips rows where now() - last_heartbeat > stale_threshold
+  // back to 'failed' so the queue doesn't wedge on ghosts.
+  lastHeartbeat: timestamp("last_heartbeat"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
