@@ -157,17 +157,101 @@ no changes to any backend contract.
   icon for unsupported mime types, and a destructive-tinted error tile
   with AlertTriangle.
 
+---
+
+## Round 3 — deep polish (same branch, same PR)
+
+Focused on the remaining rough edges: crashes that used to blank the
+page, stale-token holdouts, and the one gap in discoverability.
+
+### ⌘K command palette
+- **`components/command-palette.tsx`** (new, ~420 lines) — self-contained
+  Radix Dialog that captures `⌘K` / `Ctrl+K` globally via a
+  `window.addEventListener("keydown")` in an effect. Three grouped
+  sections:
+  - **Actions** — static nav entries (Dashboard, Runs, Tasks, Start new
+    run) plus the g-prefix hints from `keyboard-shortcuts.tsx`.
+  - **Recent runs** — lazy-fetched from `GET /api/runs?limit=25` on first
+    open, shows RunStatusDot + prompt preview + status text.
+  - **Task templates** — lazy-fetched from `GET /api/tasks`; selecting
+    one pushes to `/runs/new?taskId=…` (deep-link into Template mode).
+  Arrow keys move selection, Enter activates, Esc closes. Fuzzy matcher
+  is a hand-rolled ~20-line scorer (subsequence match + consecutive
+  bonus + prefix bonus + length tiebreak) — no `cmdk` or `fuse.js`
+  runtime dep. `sr-only` DialogTitle/Description keep Radix a11y happy
+  without a visual header.
+- **`components/top-nav.tsx`** — added a discoverable `⌘K` `<kbd>` chip
+  on the right of the nav bar (`hidden md:inline-flex`) so users know
+  the palette exists without having to find it in the help dialog.
+- **`app/layout.tsx`** — mounts `<CommandPalette />` alongside the
+  existing `<Toaster />` and `<KeyboardShortcuts />`.
+
+### Tasks page — full shadcn rebuild
+- **`app/tasks/task-manager.tsx`** — rewritten on Card + Button + Badge
+  + Input primitives. Header matches `/runs` (h1 + count Badge +
+  subtitle + right-aligned `<Plus />` button). Empty state uses the
+  same `Card` + rounded icon chip as the runs empty state. Row styling
+  matches the runs list (divide-y Card, hover bg, chevron affordance).
+  Added a tag filter chip row + debounced search input that filters by
+  name / description / tag with live counts. Delete button flips to
+  `<Loader2 />` + "Deleting…" while in flight; destructive styling is
+  hover-only so the list doesn't shout at you. Legacy tokens
+  (`text-text`, `text-text-muted`, `text-text-dim`, `bg-surface/50`,
+  `bg-emerald-600`, `border-gray-800`) are all gone. API contracts
+  untouched — still just `DELETE /api/tasks/:id` + `router.refresh()`.
+
+### Crash-safety
+- **`app/error.tsx`** — app-level error boundary (client component,
+  required by App Router). Shows the error message + digest in a
+  monospace block inside a Card, with `<Button onClick={reset}>` to
+  retry and a secondary link back to the dashboard. Logs to
+  `console.error` so browser extensions / Sentry replay pick it up.
+- **`app/global-error.tsx`** — layout-level fallback when the root
+  layout itself throws. Renders its own `<html>` / `<body>` with
+  inline styles (no Tailwind, no imports), so it still works when the
+  CSS pipeline is the thing that crashed.
+- **`app/not-found.tsx`** — friendly 404 for deleted runs/tasks and
+  typo'd URLs, with Dashboard + Runs nav buttons.
+- **Route-scoped error boundaries** — `app/runs/error.tsx`,
+  `app/runs/[id]/error.tsx`, `app/tasks/error.tsx`. Each keeps the
+  `<TopNav />` + keyboard shortcuts + command palette intact so the
+  user can navigate away from the failure instead of hitting refresh.
+
+### Loading skeletons
+- **`app/loading.tsx`** — dashboard skeleton (title block + 4 stat
+  cards + runs list rows) that mirrors the real layout so the
+  transition doesn't shift.
+- **`app/runs/loading.tsx`** — runs index skeleton (header + 6 chip
+  placeholders + search input + 8 row placeholders). Matches the real
+  `RunsBrowser` chrome exactly.
+- **`app/runs/[id]/loading.tsx`** — run detail skeleton (header + 4
+  meta-chip placeholders + input card + logs card + output card).
+- **`app/tasks/loading.tsx`** — tasks list skeleton matching the
+  rewritten TaskManager chrome.
+- **`app/runs/new/loading.tsx`** — new-run form skeleton.
+
+### Richer run actions menu
+- **`components/run-actions-menu.tsx`** — added two more items with a
+  separator:
+  - **Open raw JSON** — `window.open("/api/runs/:id", "_blank")` so
+    `curl | jq` workflows / "what does the API see?" questions are one
+    click away.
+  - **Open in new tab** — mirror of the current page URL; handy when
+    you want to keep the run open while firing another one from the
+    same tab.
+
 ## What's still next
 
-- **Tasks page polish** — `app/tasks/*` was left alone in both passes;
-  apply the same shadcn primitives + RunStatusBadge where relevant.
-- **Command palette (⌘K)** — now that we have the primitives, adding
-  Radix-based cmdk is a ~half-day job. Could share the shortcuts
-  infrastructure.
-- **Server-side filtering** — at scale (> 100 runs) the client-side
+- **Server-side filtering** at scale (> 100 runs) — the client-side
   filter in `runs-browser.tsx` should promote to a server query driven
-  by `searchParams`. Contract is already URL-shareable so the UI
+  by `searchParams`. The URL contract is already right, so the UI
   wouldn't need to change.
 - **Prompt history / favorites** — one-click re-run is the first step;
-  persisting the last N ad-hoc prompts in local storage (or a
-  lightweight `prompt_history` table) is the obvious follow-on.
+  persisting the last N ad-hoc prompts in localStorage (or a small
+  `prompt_history` table) is the obvious follow-on.
+- **Keyboard palette coverage** — extend `keyboard-shortcuts.tsx` with
+  `g t` → `/tasks` and a `.` / `/` to focus the palette input without
+  the `⌘` modifier.
+- **System health indicator** — small dot in the TopNav that polls
+  `/api/health` (or reuses `/api/runs?limit=1` as a DB liveness
+  signal) and toasts on degradation.
