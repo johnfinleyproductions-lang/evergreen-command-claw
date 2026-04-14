@@ -4,6 +4,7 @@
 // Phase 5.0 — Added right-rail <ArtifactPanel />.
 // Phase 5.4.1 — UI pass: shadcn primitives, canonical RunStatusBadge,
 // CancelRunButton + RunActionsMenu wired into the header.
+// Round 3 — blended cost chip in the meta strip.
 
 import { eq } from "drizzle-orm";
 import { notFound } from "next/navigation";
@@ -15,6 +16,11 @@ import { RunStatusBadge } from "@/components/run-status-badge";
 import { CancelRunButton } from "@/components/cancel-run-button";
 import { RunActionsMenu } from "@/components/run-actions-menu";
 import { formatDuration, formatRelativeTime } from "@/lib/utils/time";
+import {
+  estimateCostUsd,
+  formatUsd,
+  getRate,
+} from "@/lib/utils/model-pricing";
 import { RunLogPanel } from "./run-log-panel";
 import { ArtifactPanel } from "./artifact-panel";
 
@@ -53,6 +59,10 @@ export default async function RunDetailPage({
       ? input.taskId
       : null;
 
+  const cost = estimateCostUsd(run.totalTokens, run.model);
+  const rate = getRate(run.model);
+  const showCost = cost > 0 && !rate.selfHosted;
+
   return (
     <main className="mx-auto max-w-7xl px-6 py-10">
       <header className="mb-8">
@@ -71,6 +81,24 @@ export default async function RunDetailPage({
               {run.totalTokens != null && run.totalTokens > 0 && (
                 <Badge variant="muted" className="tabular-nums">
                   {run.totalTokens.toLocaleString()} tokens
+                </Badge>
+              )}
+              {showCost && (
+                <Badge
+                  variant="muted"
+                  className="tabular-nums font-mono text-primary"
+                  title={`Blended estimate — ${rate.label} at 70% input / 30% output`}
+                >
+                  {formatUsd(cost)}
+                </Badge>
+              )}
+              {rate.selfHosted && (
+                <Badge
+                  variant="muted"
+                  className="font-mono uppercase tracking-wider text-[10px]"
+                  title="Self-hosted model — zero marginal cost"
+                >
+                  local
                 </Badge>
               )}
               {run.tokensPerSec != null && (

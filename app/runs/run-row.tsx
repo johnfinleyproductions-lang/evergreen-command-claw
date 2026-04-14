@@ -5,6 +5,7 @@ import { ChevronRight } from "lucide-react";
 import type { Run } from "@/lib/db/schema/runs";
 import { RunStatusBadge } from "@/components/run-status-badge";
 import { formatRelativeTime } from "@/lib/utils/time";
+import { estimateCostUsd, formatUsd, getRate } from "@/lib/utils/model-pricing";
 
 export function RunRow({ run }: { run: Run }) {
   const input = (run.input ?? {}) as { prompt?: unknown };
@@ -14,6 +15,10 @@ export function RunRow({ run }: { run: Run }) {
       : "(no prompt)";
   const preview =
     rawPrompt.length > 160 ? rawPrompt.slice(0, 160) + "…" : rawPrompt;
+
+  const cost = estimateCostUsd(run.totalTokens, run.model);
+  const rate = getRate(run.model);
+  const showCost = cost > 0 && !rate.selfHosted;
 
   return (
     <Link
@@ -32,6 +37,14 @@ export function RunRow({ run }: { run: Run }) {
           {run.totalTokens != null && run.totalTokens > 0 && (
             <span className="tabular-nums">
               {run.totalTokens.toLocaleString()} tok
+            </span>
+          )}
+          {showCost && (
+            <span
+              className="tabular-nums font-mono text-primary/80"
+              title={`Blended estimate for ${rate.label}`}
+            >
+              {formatUsd(cost)}
             </span>
           )}
         </div>
