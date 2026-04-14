@@ -4,6 +4,7 @@ Responsibilities:
 - Pool lifecycle (open/close) with JSONB type codec
 - claim_next_run: atomic FOR UPDATE SKIP LOCKED fetch + flip to 'running'
 - update_heartbeat / sweep_stale_runs: Phase 5.3 crash-recovery primitives
+- is_cancelled / finalize_run_cancelled: Phase 5.4 cooperative-cancel primitives
 - insert_tool_call / complete_tool_call / fail_tool_call: tool execution rows
 - insert_artifact: artifact rows (briefs, reports, etc)
 - write_log: append a structured row to the `logs` table
@@ -164,6 +165,28 @@ async def sweep_stale_runs(threshold_seconds: float) -> list[UUID]:
         return [r["id"] for r in rows]
 
 
+async def is_cancelled(run_id: UUID) -> bool:
+    """Return True iff the run is currently in status='cancelled'.
+
+    Phase 5.4. Called by agent.py at the top of each iteration of
+    run_agent's loop. Also called inside _execute_literal_tool_calls
+    between tool dispatches. Must stay cheap — it's in the hot path
+    of every iteration.
+
+    The query is a single indexed PK lookup; runs with id missing
+    (shouldn't happen in practice, since the caller owns the id from
+    claim_next_run) return False, which lets the agent keep running
+    rather than aborting on a phantom cancel.
+    """
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status FROM runs WHERE id = $1",
+            run_id,
+        )
+        return row is not None and row["status"] == "cancelled"
+
+
 async def finalize_run_success(
     run_id: UUID,
     output: dict,
@@ -173,7 +196,14 @@ async def finalize_run_success(
     completion_tokens: Optional[int] = None,
     total_tokens: Optional[int] = None,
 ) -> None:
-    """Mark a run 'succeeded' and optionally record token usage + model."""
+    """Mark a run 'succeeded' and optionally record token usage + model.
+
+    Phase 5.4: the UPDATE now guards on `status != 'cancelled'` so a
+    cancel flip that arrives between run_agent returning and this call
+    can't be clobbered back to 'succeeded'. The worker loses the
+    computed output in that race, which is acceptable — cancel is rare
+    and the cancelled status is what the user asked for.
+    """
     assert _pool is not None
     async with _pool.acquire() as conn:
         await conn.execute(
@@ -187,6 +217,7 @@ async def finalize_run_success(
                 completion_tokens = $5,
                 total_tokens = $6
             WHERE id = $1
+              AND status != 'cancelled'
             """,
             run_id,
             output,
@@ -198,6 +229,17 @@ async def finalize_run_success(
 
 
 async def finalize_run_failure(run_id: UUID, error_message: str) -> None:
+    """Mark a run 'failed' with an error_message.
+
+    Phase 4.5 nuance: this can be called after finalize_run_success for
+    max_iterations_exceeded handling. It only touches status +
+    error_message + finished_at, preserving the output + token counts
+    that finalize_run_success wrote.
+
+    Phase 5.4: guarded on `status != 'cancelled'` so a cancel flip
+    sticks. The Phase 4.5 dance still works because the guard lets the
+    failure flip from 'succeeded' — it just won't clobber 'cancelled'.
+    """
     assert _pool is not None
     async with _pool.acquire() as conn:
         await conn.execute(
@@ -205,9 +247,39 @@ async def finalize_run_failure(run_id: UUID, error_message: str) -> None:
             UPDATE runs
             SET status = 'failed', error_message = $2, finished_at = now()
             WHERE id = $1
+              AND status != 'cancelled'
             """,
             run_id,
             error_message,
+        )
+
+
+async def finalize_run_cancelled(run_id: UUID, output: dict) -> None:
+    """Record partial progress for a cancelled run.
+
+    Phase 5.4. Called by execute_run when run_agent returns with
+    output.cancelled=true. The status flip itself was done by the
+    /api/runs/[id]/cancel endpoint; this call exists to record
+    diagnostics (iterations completed, tool_calls_made, reason) and
+    stamp finished_at.
+
+    The WHERE clause guards on `status='cancelled'` so a late worker
+    write can't resurrect a row that the UI already rejected as
+    terminal. If the status has somehow changed (it shouldn't — only
+    the worker itself and the cancel endpoint touch status), the
+    UPDATE is a no-op.
+    """
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE runs
+            SET output = $2, finished_at = now()
+            WHERE id = $1
+              AND status = 'cancelled'
+            """,
+            run_id,
+            output,
         )
 
 
