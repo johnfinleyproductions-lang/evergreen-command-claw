@@ -129,26 +129,37 @@ async def sweep_stale_runs(threshold_seconds: float) -> list[UUID]:
     worker that never wrote a heartbeat.
 
     Returns the list of ids that were flipped so main.py can log them.
+
+    Implementation note: we bind the threshold as a float8 and multiply
+    by `interval '1 second'`. An earlier version used `$1::text` +
+    `|| ' seconds'::interval` but asyncpg won't auto-cast a Python float
+    to text at bind time ("expected str, got float"). Keeping the
+    error_message formatting in Python also lets the query take a
+    single parameter, which is easier to reason about.
     """
     assert _pool is not None
+    error_message = (
+        f"Worker crash detected: heartbeat stale (> {threshold_seconds:g}s). "
+        f"Run swept on worker startup."
+    )
     async with _pool.acquire() as conn:
         rows = await conn.fetch(
             """
             UPDATE runs
             SET status = 'failed',
-                error_message = 'Worker crash detected: heartbeat stale '
-                    || '(> ' || $1::text || 's). Run swept on worker startup.',
+                error_message = $2,
                 finished_at = now()
             WHERE status = 'running'
               AND (
                 (last_heartbeat IS NOT NULL
-                   AND last_heartbeat < now() - ($1 || ' seconds')::interval)
+                   AND last_heartbeat < now() - ($1 * interval '1 second'))
                 OR (last_heartbeat IS NULL
-                   AND started_at < now() - ($1 || ' seconds')::interval)
+                   AND started_at < now() - ($1 * interval '1 second'))
               )
             RETURNING id
             """,
             threshold_seconds,
+            error_message,
         )
         return [r["id"] for r in rows]
 
