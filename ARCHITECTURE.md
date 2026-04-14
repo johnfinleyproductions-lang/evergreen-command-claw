@@ -254,7 +254,24 @@ Every DB write goes through this module. If you're writing raw SQL outside it yo
         content_size: Optional[int] = None,      # Phase 5.0.1
     ) -> UUID
 
-    # TODO: cancel_run(run_id) — Phase 5.4
+    async def is_cancelled(run_id: UUID) -> bool
+        # Phase 5.4. Cheap single-row read of runs.status. Called once
+        # per agent iteration and once per literal tool call so the
+        # worker can cooperatively stop work when the UI (or a direct
+        # UPDATE) flips status='cancelled'. Must stay fast — it's on
+        # the hot path.
+
+    async def finalize_run_cancelled(run_id: UUID, output: dict) -> None
+        # Phase 5.4. Writes partial output + finished_at for a row that
+        # was already transitioned to 'cancelled' by the API route.
+        # Guarded with `WHERE status = 'cancelled'` so it cannot
+        # clobber a concurrently-succeeded row. The status column
+        # itself is owned by the cancel API endpoint, not the worker.
+
+    # Phase 5.4 race defense: finalize_run_success and finalize_run_failure
+    # both carry `AND status != 'cancelled'` in their WHERE clauses, so a
+    # cancel that lands between the worker's "about to finalize" check and
+    # the actual UPDATE wins the race. Cancelled is sticky.
 
 ---
 
@@ -340,6 +357,16 @@ The policy:
 - **Heartbeat failures don't kill the run.** If Postgres is briefly unavailable, the heartbeat task logs and keeps trying. The agent loop keeps running. Worst case: the next sweep may kill a live run that fell behind on heartbeats for >2 min — acceptable given this is a single-worker dev system.
 
 Tuning knobs: `WORKER_HEARTBEAT_INTERVAL` and `WORKER_STALE_HEARTBEAT_THRESHOLD` in `.env.local`. Both read at import time in `config.py` — restart the worker after changing them.
+
+### Cancel lifecycle (Phase 5.4)
+
+Cancellation is cooperative, polled, and database-mediated. There is no OS signal, no `asyncio.Event`, no mid-LLM-turn interruption. The worker keeps running the current operation and checks `runs.status` at defined checkpoints.
+
+- **Who owns the `cancelled` transition.** The `POST /api/runs/[id]/cancel` route is the only place that writes `status='cancelled'`. It runs an atomic `UPDATE ... WHERE status IN ('pending','running') RETURNING` so transitioning a terminal run is a 409, and two concurrent cancels degrade cleanly (second one 409s).
+- **Who observes it.** The worker calls `is_cancelled(run_id)` at the top of each agent iteration (before the LLM call) and before each literal tool-call dispatch. On a hit, it writes partial progress via `finalize_run_cancelled` and returns — the heartbeat wrapper cancels the heartbeat task in its `finally`, same as any other terminal path.
+- **Cancel latency = one LLM turn.** Because the check fires at iteration top, a cancel during a 5-minute Nemotron re-ingest won't land until the current turn finishes. This is deliberate — we do not want to abort LLM calls mid-stream. Acceptable for a single-user dev system; if latency matters later, add a second check at the top of the `for tc in tool_calls:` inner loop inside `run_agent`.
+- **Sticky / terminal.** Cancelled is final. `finalize_run_success` and `finalize_run_failure` both carry `AND status != 'cancelled'` so a post-cancel worker write can't revive a cancelled row. `finalize_run_cancelled` is guarded with `WHERE status = 'cancelled'` so the status column itself is never written by the worker — only the output/finished_at columns are.
+- **Partial output preserved.** The cancelled `output` jsonb shape is `{cancelled: true, final_answer: null, iterations, message_count, tool_calls_made}` for agent mode and `{cancelled: true, tool_results, tool_calls_completed, tool_calls_remaining}` for literal mode. The `cancelled: true` flag is the canonical "this is a cancel, not a success or failure" signal — reach for it before inferring anything from `error_message` or `finished_at`.
 
 ---
 
@@ -446,9 +473,9 @@ All under `app/api/`.
 
 - `GET /api/runs` — list recent runs, most recent first.
 - `POST /api/runs` — body `{task_id?, input}`. Inserts `status=pending`. Worker picks up within poll interval.
-- `GET /api/runs/[id]` — single run including output/tokens/timestamps.
 - `GET /api/runs/[id]/logs` — **SSE** stream. Initial drain of all existing logs, then polls for new rows. Client must dedup by `id` via `Set` (see `lib/hooks/use-run-logs.ts` `seenIdsRef`).
-- `POST /api/runs/[id]/cancel` — flips status to `cancelled`. Worker cooperative-cancel TODO.
+- `POST /api/runs/[id]/cancel` — **Phase 5.4.** Atomic `UPDATE runs SET status='cancelled' WHERE id=$1 AND status IN ('pending','running') RETURNING id, previousStatus`. Returns `200 {id, previousStatus, newStatus:'cancelled'}` on success, `409 {error, currentStatus}` if the run is already terminal, `404` if the id doesn't exist, `400` if the id isn't a UUID. Idempotent-shaped: two concurrent cancels both see the row; only the first UPDATE matches the `status IN (...)` guard, the second 409s. The worker observes the transition cooperatively (see §5 "Cancel lifecycle").
+- There is **no** `GET /api/runs/[id]` route. The run detail view (`app/runs/[id]/page.tsx`) is a server component that queries Drizzle directly: `db.select().from(runs).where(eq(runs.id, id)).limit(1)`. If you need a JSON read endpoint, add one — don't assume it exists.
 - `GET /api/tasks`, `POST /api/tasks`, `PATCH /api/tasks/[id]`, `DELETE /api/tasks/[id]` — task CRUD.
 - `GET /api/runs/[id]/artifacts` — list artifacts for a run (Phase 5.0).
 - `GET /api/artifacts/[id]/content` — fetch artifact body. **Phase 5.0.1:** reads from `artifacts.content` column first (happy path), falls back to `file_path` on disk only for legacy rows where `content IS NULL`. The fallback exists only so old runs from before the migration still render — new runs never touch disk on read.
@@ -641,6 +668,29 @@ Kick off any agent run and watch the heartbeat bump in real time:
 
 Expect: `last_heartbeat` advances every ~10s while `status='running'`; gap `now() - last_heartbeat` stays < 20s.
 
+**Test H — Phase 5.4 cooperative cancel mid-agent-run:**
+
+Kick off a long-ish agent run, cancel it mid-flight, confirm partial output + sticky cancel. Uses the psql-direct-insert bypass (§7) for headless testing:
+
+    # 1. Insert a multi-iteration prompt directly
+    RUN_ID=$(docker exec -i evergreen-command-db psql -U command -d evergreen_command -tAc \
+      "INSERT INTO runs (input) VALUES ('{\"prompt\":\"Research 5 distinct topics and write a brief on each.\"}'::jsonb) RETURNING id;")
+    echo "run: $RUN_ID"
+    # 2. Wait ~20s so the worker claims + runs at least one iteration
+    sleep 20
+    # 3. Fire the cancel (requires ev-session cookie — log in via UI first, or UPDATE directly as a shortcut):
+    docker exec -i evergreen-command-db psql -U command -d evergreen_command \
+      -c "UPDATE runs SET status='cancelled' WHERE id='$RUN_ID' AND status IN ('pending','running') RETURNING id, status;"
+    # 4. Wait one LLM turn (up to ~60s for the current iteration to finish)
+    sleep 75
+    # 5. Verify terminal state
+    docker exec -i evergreen-command-db psql -U command -d evergreen_command \
+      -c "SELECT status, finished_at IS NOT NULL AS finished, output->>'cancelled' AS cancel_flag, output->>'iterations' AS iters FROM runs WHERE id='$RUN_ID';"
+
+Expect: `status='cancelled'`, `finished=t`, `cancel_flag='true'`, `iters` > 0 (partial progress preserved). Worker log should show `"cancellation detected at iteration N; stopping agent loop"` followed by `"run <id> cancelled via agent (<N> iter completed, <M> tool calls)"`.
+
+For the real API path (cookie-gated), substitute step 3 with `curl -sX POST http://127.0.0.1:3015/api/runs/$RUN_ID/cancel -b cookies.txt` where `cookies.txt` carries the `ev-session` cookie from a UI login. A second cancel should 409 with `{"error":"...","currentStatus":"cancelled"}`.
+
 ---
 
 ## 13. Known gotchas
@@ -690,7 +740,7 @@ Chronological record of what landed when, with the commit that landed it.
 | 5.1   | Task create/edit/delete/run UI                              | done      | `4b59ed4` |
 | 5.2   | Rendered `final_answer` hero panel on run detail            | done      |           |
 | 5.3   | Worker crash recovery + heartbeat                           | shipped   |           |
-| 5.4   | Cooperative cancel wired through agent loop                 | pending   |           |
+| 5.4   | Cooperative cancel wired through agent loop (backend only)  | shipped   |           |
 | 6.0   | Second worker node + fast/slow model tiering                | pending   |           |
 | 6.1   | Remote access layer (FileBrowser + Tailscale primary, NCB secondary) | pending |   |
 
@@ -699,6 +749,8 @@ Chronological record of what landed when, with the commit that landed it.
 **Phase 5.0.1 shipped note:** the Phase 5.0 content endpoint 500 was caused by the web app and the worker having different views of `worker/artifacts/` on disk. We added `content TEXT` and `content_size INTEGER` columns to the `artifacts` table, taught `insert_artifact()` and `write_brief` to populate them, and rewrote `app/api/artifacts/[id]/content/route.ts` to read from the DB column first with the file path only as a legacy-row fallback. Smoke test: new artifact row showed `content_size=148` matching `LENGTH(content)=148`, content endpoint returned 200, preview rendered inline. Gotcha hit during rollout: the worker was restarted before `git checkout` so it imported the old Python code on disk — second restart picked up the fix. See §13 "Filesystem state between processes is a liability."
 
 **Phase 5.1 shipped note:** the `/tasks` page is now a fully interactive CRUD surface. Create/edit/delete/run all happen in-place via modals; the form covers the real seven-field schema (`name`, `description`, `prompt`, `systemPrompt`, `toolsAllowed[]`, `tags[]`, `inputSchema` as raw JSON); the run dialog parses `{{vars}}` from the prompt, renders one input per variable, and shows a live rendered preview before firing. Backed by a new `PATCH`/`DELETE` handler at `app/api/tasks/[id]/route.ts` (partial update: fields absent from the body stay put, `null` clears nullable columns, empty body rejected) and a shared `lib/prompt-template.ts` util so the client preview and the server-side render in `POST /api/runs` share the same regex. Server component + client island pattern: `app/tasks/page.tsx` stays a 27-line server component that queries Drizzle directly, `<TaskManager>` owns all modal state and calls `router.refresh()` after each mutation. Smoke tested end-to-end: create with `{{vars}}`, edit in place, run with live preview landing on `/runs/[id]`, delete with native `confirm()`, no-var task via "ready to fire" path, validation errors fire without API call. Commit `4b59ed4` via PR #1 squash merge. Note: ARCHITECTURE.md §3 `tasks` schema documentation had drift (old docs said `prompt_template` + `default_input`, real Drizzle schema has `prompt` + `system_prompt` + `tools_allowed[]` + `input_schema` + `tags[]`) — fixed in this same commit.
+
+**Phase 5.4 shipped note (backend):** cooperative cancel landed end-to-end on the worker side. `POST /api/runs/[id]/cancel` is now a real route: atomic `UPDATE ... WHERE status IN ('pending','running') RETURNING`, 404 on unknown id, 409 on already-terminal runs (idempotent-shaped). `worker/db.py` gained `is_cancelled(run_id)` and `finalize_run_cancelled(run_id, output)`, and `finalize_run_success` / `finalize_run_failure` grew `AND status != 'cancelled'` guards so a worker write can never clobber a post-cancel row. `worker/agent.py` polls `is_cancelled` once per iteration (before the LLM call), breaks out of the loop, and returns an output shape with `cancelled: true` + partial `iterations` / `tool_calls_made`. `worker/main.py` handles the cancelled branch first in `execute_run` (new finalize_run_cancelled dispatch) and adds a per-call cancel check to `_execute_literal_tool_calls` so literal-mode runs also stop between tool dispatches. Cancel latency is one LLM turn by design — no mid-stream LLM interruption. UI cancel button deferred to Phase 5.4.1. Smoke test H in §12 documents the psql-UPDATE path and the curl-with-cookie path.
 
 **Phase 5.3 shipped note:** worker crash recovery + heartbeat landed. `runs.last_heartbeat` added via migration `0002_phase_5_3_heartbeat.sql` with a partial index `idx_runs_heartbeat ON runs(last_heartbeat) WHERE status='running'`. `worker/db.py` gained `update_heartbeat(run_id)` and `sweep_stale_runs(threshold_seconds)`; `claim_next_run` now stamps `last_heartbeat=now()` on claim so brand-new runs don't look stale for a full heartbeat interval. `worker/main.py` gained `_heartbeat_loop` (bumps every `HEARTBEAT_INTERVAL_SECONDS`, default 10s) and `_run_with_heartbeat` (wraps `execute_run` so the heartbeat task is cancelled on return) — kept separate from `execute_run` so the §9 try/except topology stays untouched. Startup sweeps any `running` row older than `STALE_HEARTBEAT_THRESHOLD_SECONDS` (default 120s, 12× the interval) to `failed` with `error_message='Worker crash detected: heartbeat stale (> 120s). Run swept on worker startup.'`. Smoke tests F and G in §12 document the kill-mid-run recovery path and the live-heartbeat observation path. Env knobs: `WORKER_HEARTBEAT_INTERVAL`, `WORKER_STALE_HEARTBEAT_THRESHOLD`. Known limitation: we only sweep on startup, not on a timer — a second live worker watching for another's death is a Phase 6.0 concern.
 
@@ -746,6 +798,8 @@ Patterns we've tried and rejected. Don't re-introduce these without reading the 
 - **Coordinating state across process boundaries via shared filesystem paths.** Phase 5.0 tried this for artifact content and it broke immediately. Put state that crosses a process boundary in the database. See §13.
 - **Inlining the heartbeat task into `execute_run`.** The separation between `_run_with_heartbeat` and `execute_run` is deliberate — keeps the §9 try/except topology untouched when the heartbeat story evolves.
 - **Running `npm run dev` on top of `evergreen restart`.** The CLI already starts the web server on :3015. Double-starting produces `EADDRINUSE`. Either attach with `evergreen attach` or `evergreen stop` first.
+- **Clobbering `cancelled` from the worker.** After Phase 5.4 the cancel transition is owned exclusively by the API route. Any worker-side finalize must carry `AND status != 'cancelled'` in its WHERE clause, and `finalize_run_cancelled` must be guarded `WHERE status = 'cancelled'` so it only writes output/finished_at, never status. If you add a new terminal-state writer, start from the existing guarded shapes in `worker/db.py`; don't invent a new UPDATE.
+- **Preempting LLM calls on cancel.** The polling check lives at iteration top, not mid-stream. Don't try to cancel an in-flight `llm.chat` call — the cost of ragged partial responses and broken asyncpg pool state is not worth the ~60s of latency. One LLM turn of cancel latency is the contract.
 
 ---
 
@@ -794,6 +848,9 @@ Shutdown (clean):
 ## 19. Debugging journal
 
 Persistent notes from past incidents. Newest on top.
+
+**2026-04-13 — Phase 5.4 shipped, cooperative cancel backend**
+Landed on branch `phase-5.4-cooperative-cancel` cut from `b27fd71`. Chose polled cooperative cancel over `asyncio.Event` + `ContextVar` — the event approach is marginally lower latency on paper but adds a second source of truth that has to stay in sync with `runs.status`, and the DB row is the only thing that survives a worker restart. Picked backend-only over "backend + UI button" so the branch ships small and testable. Four commits: cancel route (`e91504c`), db primitives + finalize guards (`8c6a169`), agent iteration-top check (`36f8bfb`), main.py cancelled branch + literal per-call check (`3876543`). Pulled on two subtle things mid-implementation: (1) the `iterations` count in the cancelled output shape is `iteration` not `iteration + 1` — cancel fires at the top of iteration N *before* any work for that iteration completes, so N-1 iterations are actually done; (2) no `GET /api/runs/[id]` endpoint exists — run detail is a server component reading Drizzle directly, so the doc drift in §7 about that route had to be fixed alongside. Cancel latency contract is one LLM turn (up to ~60s on Nemotron re-ingest) — documented in §5 and §17. Smoke test H added to §12.
 
 **2026-04-13 — Phase 5.3 smoke-test session surfaced three pieces of doc drift**
 Folded into PR #4 alongside the 5.3 shipment. During Tests F and G, hit (1) `curl` against `:3000` returning `{"detail":"Method Not Allowed"}` from some other FastAPI process — real port is `:3015` (set in `package.json`); (2) `psql -U evergreen` missing because Postgres lives in Docker as `evergreen-command-db` with user `command`; (3) `curl -iX POST http://127.0.0.1:3015/api/runs` returning `HTTP/1.1 307 Temporary Redirect / location: /login` — the `middleware.ts` `ev-session` cookie gate was undocumented. Added §7 "Auth middleware" documenting public paths and the psql-direct-insert bypass, added §11 "evergreen CLI" block, fixed port references in §0 §1 §12 §18, and fixed the psql command in §0. Test G passed after using the psql bypass: run `70c90a2b-…` showed `running | last_heartbeat populated | age 3.5s` with heartbeat advancing. Test F passed earlier in the session: run `d498f02c-…` (stuck from the asyncpg-bind crash during initial 5.3 testing) was swept on next worker startup with the exact expected error_message.
