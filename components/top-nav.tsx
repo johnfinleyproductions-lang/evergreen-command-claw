@@ -7,6 +7,7 @@ import { usePathname } from "next/navigation";
 import { Terminal, Plus } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
 import { Button } from "@/components/ui/button";
+import { HealthIndicator } from "@/components/health-indicator";
 
 const LINKS = [
   { href: "/", label: "Dashboard" },
@@ -59,6 +60,7 @@ export function TopNav() {
         </div>
 
         <div className="ml-auto flex items-center gap-2">
+          <HealthIndicator />
           <span
             aria-hidden
             className="hidden md:inline-flex items-center gap-1 rounded-md border border-border bg-secondary/40 px-2 py-1 text-[10px] text-muted-foreground font-mono"
