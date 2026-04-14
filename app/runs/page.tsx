@@ -1,14 +1,14 @@
 // app/runs/page.tsx
 
+import { Suspense } from "react";
 import Link from "next/link";
 import { desc } from "drizzle-orm";
-import { Plus, Sparkles } from "lucide-react";
+import { Plus } from "lucide-react";
 import { db } from "@/lib/db/client";
 import { runs } from "@/lib/db/schema/runs";
-import { Card } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { RunRow } from "./run-row";
+import { Button } from "@/components/ui/button";
+import { RunsBrowser, type RunListItem } from "./runs-browser";
 
 export const dynamic = "force-dynamic";
 
@@ -18,6 +18,27 @@ export default async function RunsPage() {
     .from(runs)
     .orderBy(desc(runs.createdAt))
     .limit(100);
+
+  // Trim to a serializable, client-friendly shape. Drizzle returns Date
+  // objects + full jsonb blobs; we only need a preview string here.
+  const items: RunListItem[] = rows.map((r) => {
+    const input = (r.input ?? {}) as { prompt?: unknown };
+    const prompt =
+      typeof input.prompt === "string" && input.prompt.length > 0
+        ? input.prompt
+        : "(no prompt)";
+    return {
+      id: r.id,
+      status: r.status,
+      createdAt:
+        r.createdAt instanceof Date
+          ? r.createdAt.toISOString()
+          : String(r.createdAt),
+      prompt,
+      model: r.model ?? null,
+      totalTokens: r.totalTokens ?? null,
+    };
+  });
 
   return (
     <main className="mx-auto max-w-7xl px-6 py-10">
@@ -30,7 +51,7 @@ export default async function RunsPage() {
             </Badge>
           </div>
           <p className="text-muted-foreground text-sm mt-1">
-            Every agent run, newest first.
+            Every agent run, newest first. Filter by status or search prompts.
           </p>
         </div>
         <Button asChild size="sm">
@@ -41,23 +62,9 @@ export default async function RunsPage() {
         </Button>
       </header>
 
-      {rows.length === 0 ? (
-        <Card className="p-10 text-center">
-          <div className="mx-auto h-10 w-10 rounded-full bg-primary/10 text-primary flex items-center justify-center mb-3">
-            <Sparkles className="h-5 w-5" />
-          </div>
-          <p className="text-foreground font-medium">No runs yet.</p>
-          <p className="text-muted-foreground text-sm mt-1">
-            Once you fire a run, it’ll show up here.
-          </p>
-        </Card>
-      ) : (
-        <Card className="divide-y divide-border overflow-hidden p-0">
-          {rows.map((run) => (
-            <RunRow key={run.id} run={run} />
-          ))}
-        </Card>
-      )}
+      <Suspense fallback={null}>
+        <RunsBrowser runs={items} />
+      </Suspense>
     </main>
   );
 }
