@@ -20,9 +20,9 @@ export default async function NewRunPage({
 
   return (
     <main className="mx-auto max-w-3xl px-6 py-10">
-      <header className="mb-6">
-        <h1 className="text-2xl font-semibold text-text">New Run</h1>
-        <p className="text-text-muted text-sm mt-1">
+      <header className="mb-8">
+        <h1 className="text-2xl font-semibold tracking-tight">New run</h1>
+        <p className="text-muted-foreground text-sm mt-1">
           Pick a task template or write a free-form prompt.
         </p>
       </header>
