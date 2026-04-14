@@ -68,13 +68,106 @@ directly — the API route is still the sole owner of that transition
 **Cancel latency.** Still ~one LLM turn (no mid-stream interruption),
 per the Phase 5.4 design in ARCHITECTURE.md §15.
 
-## What's next
+---
 
-- **Phase 5.4.2 (optional)** — live-streaming status on the run detail
-  page so the button unmounts without a manual refresh. Plumb into the
-  existing SSE log stream rather than adding a separate poller.
-- **Tasks page polish** — `app/tasks/*` was left alone in this pass;
+## Round 2 — autonomous improvements (same branch, same PR)
+
+Shipped on top of the initial Phase 5.4.1 commits without user
+intervention. Goal: keep the blast radius tight, no new runtime deps,
+no changes to any backend contract.
+
+### Feedback plumbing
+- **Toast system** (`lib/hooks/use-toast.tsx`, `components/ui/toast.tsx`,
+  `components/ui/toaster.tsx`) — thin Radix Toast wrapper + imperative
+  `toast({ title, description, variant })` API. Max 3 visible, 4s
+  default duration, listener-store pattern. `<Toaster />` mounted once
+  at the root so any client component can fire a toast without plumbing
+  refs.
+- **Cancel button** now toasts on 200 ("Run cancelled"), 409
+  ("Already terminal"), and 4xx/5xx (destructive variant with the
+  server message), alongside the inline error Card. Still treats 200 +
+  409 as success for refresh purposes.
+- **New-run form** now fires a destructive toast on submit failure in
+  addition to the inline error Card.
+
+### Reactivity
+- **Run detail auto-refresh on natural completion** — added a `useEffect`
+  in `app/runs/[id]/run-log-panel.tsx` that watches the SSE
+  `finalRunStatus` value. When the stream reports a terminal status
+  (`succeeded | failed | cancelled`), it schedules a one-shot
+  `router.refresh()` 300ms later. Result: the cancel button unmounts
+  and the Output / Error cards appear without a manual F5. Guarded by a
+  `refreshedRef` so it never re-fires on the same stream.
+
+### Run actions
+- **`components/run-actions-menu.tsx`** — DropdownMenu on the run detail
+  header with three actions:
+  - **Re-run** — pushes to `/runs/new?prompt=...` for ad-hoc runs or
+    `/runs/new?taskId=...` for template-backed runs.
+  - **Copy prompt** — clipboard write with secure-context
+    `execCommand('copy')` fallback; toasts success/fail.
+  - **Copy run id** — same copy pattern; useful for grepping logs.
+- **`app/runs/new/page.tsx` + `new-run-form.tsx`** — accept
+  `?prompt=` and `?taskId=` searchParams. When `?prompt=` is set, the
+  form opens in Custom mode with the textarea pre-filled. One-click
+  re-run now works end-to-end.
+
+### Runs list — filter + search
+- **`app/runs/runs-browser.tsx`** (new, client) — 6 status chips
+  (All + 5 run_status values) with live counts, a debounced (150ms)
+  prompt search input with clear-X affordance, URL-synced via
+  `router.replace(/runs?status=…&q=…)` so filter state is shareable
+  and survives reload. Uses the existing RunStatusBadge so rows look
+  identical to the v1 list; empty state distinguishes "no matches"
+  from "no runs yet."
+- **`app/runs/page.tsx`** — trimmed to a lean server query +
+  `<RunsBrowser>` inside a `<Suspense>` boundary (required for
+  `useSearchParams` in a Next 15 client component).
+
+### Keyboard shortcuts
+- **`components/keyboard-shortcuts.tsx`** (new, mounted once in
+  `app/layout.tsx`) — GitHub-style two-key navigation with a 1.2s
+  g-prefix timeout:
+  - `g d` → `/` (dashboard)
+  - `g r` → `/runs` (runs list)
+  - `g n` → `/runs/new` (new run)
+  - `?` → shortcuts help Dialog
+  - `Esc` → closes dialogs/menus (Radix default)
+  Ignores events when focus is inside `input / textarea / select` or
+  `contenteditable`. Renders a subtle bottom-left hint chip
+  ("g · then d r n") while the prefix is pending.
+
+### Login page
+- Rebuilt `app/login/page.tsx` on Card + Input + Label + Button so it
+  stops referencing stale color tokens (`bg-surface`, `text-muted`,
+  `bg-accent`, `bg-accent-dim`) that no longer exist in the new theme
+  and renders against `--color-background`. Terminal brand icon
+  matches TopNav, Lock icon inside the input, Loader2 spinner on
+  submit, AlertTriangle error tile. Behavior unchanged — same
+  `POST /api/auth/login` contract, same `router.push("/")` on success.
+
+### Artifact preview dialog polish
+- **`app/runs/[id]/artifact-preview-dialog.tsx`** — replaced inline
+  `formatSize` dupe with shared `formatBytes` from `lib/utils/time`.
+  Download rendered via `<Button asChild variant="outline">`. Added a
+  **Copy** action for previewable text content (secure-context
+  clipboard + `execCommand` fallback + toast feedback), an
+  **Open in new tab** affordance for images, a Skeleton loading state
+  replacing the italic "Loading content…" line, a FileX empty-state
+  icon for unsupported mime types, and a destructive-tinted error tile
+  with AlertTriangle.
+
+## What's still next
+
+- **Tasks page polish** — `app/tasks/*` was left alone in both passes;
   apply the same shadcn primitives + RunStatusBadge where relevant.
-- **Login page polish** — same.
 - **Command palette (⌘K)** — now that we have the primitives, adding
-  Radix-based cmdk is a ~half-day job.
+  Radix-based cmdk is a ~half-day job. Could share the shortcuts
+  infrastructure.
+- **Server-side filtering** — at scale (> 100 runs) the client-side
+  filter in `runs-browser.tsx` should promote to a server query driven
+  by `searchParams`. Contract is already URL-shareable so the UI
+  wouldn't need to change.
+- **Prompt history / favorites** — one-click re-run is the first step;
+  persisting the last N ad-hoc prompts in local storage (or a
+  lightweight `prompt_history` table) is the obvious follow-on.
