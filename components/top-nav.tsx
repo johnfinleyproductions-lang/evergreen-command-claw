@@ -8,11 +8,13 @@ import { Terminal, Plus } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
 import { Button } from "@/components/ui/button";
 import { HealthIndicator } from "@/components/health-indicator";
+import { ProfileSwitcher } from "@/components/profile-switcher";
 
 const LINKS = [
   { href: "/", label: "Dashboard" },
   { href: "/runs", label: "Runs" },
   { href: "/tasks", label: "Tasks" },
+  { href: "/profiles", label: "Profiles" },
 ];
 
 export function TopNav() {
@@ -60,6 +62,7 @@ export function TopNav() {
         </div>
 
         <div className="ml-auto flex items-center gap-2">
+          <ProfileSwitcher />
           <HealthIndicator />
           <span
             aria-hidden

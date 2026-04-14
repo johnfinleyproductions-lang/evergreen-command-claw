@@ -1,15 +1,17 @@
 // app/runs/new/new-run-form.tsx
 //
 // Phase 5.4.1 — rebuilt on shadcn primitives.
-// Phase 5.4.1 (round 2) — accepts an initialPrompt for one-click re-run:
-// if ?prompt= is set, the form opens in Custom mode with the textarea
-// pre-filled. Errors also fire a toast in addition to the inline Card.
+// Phase 5.4.1 (round 2) — accepts an initialPrompt for one-click re-run.
+// Phase 5.4.2 — surfaces the active business profile as an attached-context
+// chip so you can see the context that will ride along before firing. The
+// server does the actual injection; this is read-only.
 
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Rocket, Loader2 } from "lucide-react";
+import Link from "next/link";
+import { Rocket, Loader2, UserCircle2 } from "lucide-react";
 import type { Task } from "@/lib/db/schema/tasks";
 import { cn } from "@/lib/utils/cn";
 import { Button } from "@/components/ui/button";
@@ -48,6 +50,27 @@ export function NewRunForm({ tasks, initialTaskId, initialPrompt }: Props) {
   const [customPrompt, setCustomPrompt] = useState(initialPrompt ?? "");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [activeProfile, setActiveProfile] = useState<
+    { id: string; name: string } | null
+  >(null);
+
+  // Lazy-load the active profile so the form can show the attached-context
+  // chip. If the fetch fails, the form still works — we just don't surface
+  // the chip.
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/profiles/active", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((data: { profile: { id: string; name: string } | null }) => {
+        if (!cancelled) setActiveProfile(data.profile);
+      })
+      .catch(() => {
+        /* no chip, no problem */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const selectedTask = tasks.find((t) => t.id === selectedTaskId);
 
@@ -91,6 +114,29 @@ export function NewRunForm({ tasks, initialTaskId, initialPrompt }: Props) {
 
   return (
     <form onSubmit={handleSubmit} className="space-y-6">
+      {activeProfile && (
+        <Card className="p-3 flex items-start gap-3 border-primary/30 bg-primary/5">
+          <UserCircle2 className="h-4 w-4 text-primary shrink-0 mt-0.5" />
+          <div className="flex-1 text-sm">
+            <p className="text-foreground">
+              Profile{" "}
+              <span className="font-mono text-primary">{activeProfile.name}</span>{" "}
+              will be attached as context.
+            </p>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              Its content is prepended to the prompt on the server before the
+              run starts.{" "}
+              <Link
+                href="/profiles"
+                className="text-primary hover:underline underline-offset-4"
+              >
+                Manage profiles
+              </Link>
+            </p>
+          </div>
+        </Card>
+      )}
+
       <div className="inline-flex items-center rounded-lg border border-border bg-secondary/40 p-1">
         <button
           type="button"

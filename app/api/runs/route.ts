@@ -3,12 +3,19 @@
 // Collection-level API for runs:
 //   GET  /api/runs                     → list with optional status + taskId filters
 //   POST /api/runs                     → create a new run (free-form or from template)
+//
+// Phase 5.4.2 — if a business profile is active, its content is prepended to
+// the outgoing prompt under a `## Context` header and a `profile: {id,name}`
+// breadcrumb is written to runs.input. The server is the single source of
+// truth for this injection; clients never see the blended prompt on the way
+// in so there's no risk of double-prepending on retry.
 
 import { NextRequest, NextResponse } from "next/server";
 import { and, desc, eq } from "drizzle-orm";
 import { db } from "@/lib/db/client";
 import { runs } from "@/lib/db/schema/runs";
 import { tasks } from "@/lib/db/schema/tasks";
+import { profiles } from "@/lib/db/schema/profiles";
 
 export const runtime = "nodejs";
 
@@ -92,6 +99,10 @@ export async function POST(request: NextRequest) {
     prompt?: unknown;
     model?: unknown;
     inputVars?: unknown;
+    // Phase 5.4.2: clients can opt out of profile injection by passing
+    // `skipProfile: true`. Defaults to false so the default experience is
+    // "context is automatic."
+    skipProfile?: unknown;
   };
 
   const model =
@@ -137,6 +148,20 @@ export async function POST(request: NextRequest) {
     finalPrompt = b.prompt.trim();
   }
 
+  // Inject the active business profile, if any and not explicitly skipped.
+  let attachedProfile: { id: string; name: string } | null = null;
+  if (b.skipProfile !== true) {
+    const [active] = await db
+      .select()
+      .from(profiles)
+      .where(eq(profiles.isActive, true))
+      .limit(1);
+    if (active && active.content.trim().length > 0) {
+      attachedProfile = { id: active.id, name: active.name };
+      finalPrompt = `## Context: ${active.name}\n\n${active.content.trim()}\n\n---\n\n${finalPrompt}`;
+    }
+  }
+
   const [inserted] = await db
     .insert(runs)
     .values({
@@ -145,6 +170,7 @@ export async function POST(request: NextRequest) {
       input: {
         prompt: finalPrompt,
         ...(Object.keys(inputVars).length > 0 ? { variables: inputVars } : {}),
+        ...(attachedProfile ? { profile: attachedProfile } : {}),
       },
       model,
     })
