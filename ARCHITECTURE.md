@@ -144,6 +144,7 @@ Every execution, agent-mode or literal-mode.
 - `tokens_per_sec real`
 - `started_at timestamp`
 - `finished_at timestamp`
+- `last_heartbeat timestamp` — **Phase 5.3:** bumped every `HEARTBEAT_INTERVAL_SECONDS` by the worker while a run is active. On worker startup, rows where `status='running'` and `last_heartbeat < now() - STALE_HEARTBEAT_THRESHOLD_SECONDS` get swept to `failed`. Partial index `idx_runs_heartbeat ON runs(last_heartbeat) WHERE status='running'` keeps the sweep cheap.
 - `created_at timestamp default now() NOT NULL`
 
 ### `run_logs`
@@ -186,7 +187,19 @@ Every DB write goes through this module. If you're writing raw SQL outside it yo
 
     async def claim_next_run() -> Optional[dict]
         # SELECT ... FOR UPDATE SKIP LOCKED, flips status='running',
-        # sets started_at=now(). Returns full row dict or None.
+        # sets started_at=now() AND last_heartbeat=now() (Phase 5.3).
+        # Returns full row dict or None.
+
+    async def update_heartbeat(run_id: UUID) -> None
+        # Phase 5.3. Bumps last_heartbeat=now() for a 'running' row.
+        # WHERE clause guards against clobbering a terminal row.
+
+    async def sweep_stale_runs(threshold_seconds: float) -> list[UUID]
+        # Phase 5.3. Called once on worker startup. Flips any 'running'
+        # row whose last_heartbeat is older than threshold_seconds to
+        # 'failed' with a diagnostic error_message. Also sweeps rows
+        # with NULL last_heartbeat and a stale started_at (pre-5.3
+        # claims). Returns the list of ids swept.
 
     async def finalize_run_success(
         run_id: UUID,
@@ -226,7 +239,7 @@ Every DB write goes through this module. If you're writing raw SQL outside it yo
         content_size: Optional[int] = None,      # Phase 5.0.1
     ) -> UUID
 
-    # TODO: cancel_run(run_id), reset_stale_running_rows() — sign before Phase 5.3
+    # TODO: cancel_run(run_id) — Phase 5.4
 
 ---
 
@@ -236,7 +249,29 @@ Every DB write goes through this module. If you're writing raw SQL outside it yo
 
 1. `open_pool()` — asyncpg pool against `evergreen_command`.
 2. Register tools into `ToolRegistry`.
-3. Enter the claim loop: `while True: run = await claim_next_run(); if run: await execute_run(run); else: await asyncio.sleep(poll_interval)`.
+3. **Phase 5.3:** `sweep_stale_runs(STALE_HEARTBEAT_THRESHOLD_SECONDS)` once — flips any `status='running'` rows with stale heartbeats to `failed` before we start taking new work. Logs the count + ids. A failure here is swallowed (logged only) so a sweep bug can't block the worker from coming up.
+4. Enter the claim loop: `while True: run = await claim_next_run(); if run: await _run_with_heartbeat(run); else: await asyncio.sleep(poll_interval)`.
+
+`_run_with_heartbeat(run)` (Phase 5.3 wrapper):
+
+    hb_task = asyncio.create_task(_heartbeat_loop(run["id"]))
+    try:
+        await execute_run(run)
+    finally:
+        hb_task.cancel()
+        try: await hb_task
+        except asyncio.CancelledError: pass
+
+The wrapper is deliberately separate from `execute_run` so the inner try/except/finally topology stays untouched (see §9).
+
+`_heartbeat_loop(run_id)`:
+
+    while True:
+        await asyncio.sleep(config.HEARTBEAT_INTERVAL_SECONDS)
+        try:
+            await update_heartbeat(run_id)
+        except Exception:
+            log.exception(...)           # never kill the run on a hb failure
 
 `execute_run(run)`:
 
@@ -276,7 +311,20 @@ Every DB write goes through this module. If you're writing raw SQL outside it yo
 
 **Indent drift is the silent killer here.** The `if result["output"].get("error") == "max_iterations_exceeded"` branch MUST live inside the `try` block at the same indent as the `finalize_run_success` call. When editing this, use a regex-based patch script, not nano paste.
 
-**Crash recovery:** TODO — on worker startup, sweep `status='running'` rows older than N minutes back to pending or failed. Not implemented yet. Heartbeat on the run row also TODO.
+### Crash-recovery policy (Phase 5.3)
+
+The system assumes one worker at a time. If it crashes, rows it was executing get stuck at `status='running'` — the UI sees them as active forever and the claim loop can't notice because `FOR UPDATE SKIP LOCKED` only touches `pending` rows.
+
+The policy:
+
+- **Heartbeat cadence.** While a run is active, a background asyncio task (started in `_run_with_heartbeat`, cancelled when `execute_run` returns) writes `runs.last_heartbeat = now()` every `HEARTBEAT_INTERVAL_SECONDS` (default 10s).
+- **Stale threshold.** Default `STALE_HEARTBEAT_THRESHOLD_SECONDS = 120s` — 12× the heartbeat interval. Any `running` row whose last heartbeat is older than this is presumed dead.
+- **Startup sweep.** `sweep_stale_runs(threshold)` runs once before the poll loop starts. It flips dead rows to `failed` with `error_message = 'Worker crash detected: heartbeat stale (> 120s). Run swept on worker startup.'` and returns the id list for logging. Null-heartbeat rows with a stale `started_at` are also swept — covers pre-5.3 claims from before the column existed.
+- **No mid-run sweep.** We only sweep on startup. A live worker never cleans up after another live worker — that's a multi-worker concern slated for Phase 6.0.
+- **Output preserved on sweep.** Sweep uses the same UPDATE shape as `finalize_run_failure` — it only touches `status`, `error_message`, `finished_at`. Any partial `output` or token counts stay intact.
+- **Heartbeat failures don't kill the run.** If Postgres is briefly unavailable, the heartbeat task logs and keeps trying. The agent loop keeps running. Worst case: the next sweep may kill a live run that fell behind on heartbeats for >2 min — acceptable given this is a single-worker dev system.
+
+Tuning knobs: `WORKER_HEARTBEAT_INTERVAL` and `WORKER_STALE_HEARTBEAT_THRESHOLD` in `.env.local`. Both read at import time in `config.py` — restart the worker after changing them.
 
 ---
 
@@ -407,6 +455,8 @@ Required:
 Optional:
 
 - `WORKER_POLL_INTERVAL_SEC` — claim loop sleep between empty polls.
+- `WORKER_HEARTBEAT_INTERVAL` — **Phase 5.3:** seconds between heartbeat writes, default `10.0`.
+- `WORKER_STALE_HEARTBEAT_THRESHOLD` — **Phase 5.3:** seconds after which a `running` row's heartbeat is considered stale and sweepable, default `120.0`.
 - `WEB_SEARCH_PROVIDER`, `WEB_SEARCH_API_KEY` — TODO audit.
 
 ---
@@ -428,6 +478,8 @@ Three places where exceptions can land. Getting the indent wrong here is how you
         current_run_id.reset(token)
 
 Rule: **any edit to `execute_run` uses a regex patch script, never nano paste.** Nano paste drops or adds whitespace invisibly when bracketed-paste mode is mismatched.
+
+**Phase 5.3 note:** the heartbeat task lives in `_run_with_heartbeat`, *outside* `execute_run`. Keep it that way. Adding a try/finally to `execute_run` to cancel the heartbeat task would be the exact kind of edit that introduces silent indent drift.
 
 Verify before restart:
 
@@ -501,6 +553,40 @@ Expect: budget notice at iter 15 (remaining≤5), hard stop at iter 18 (remainin
 
 Expect: `content_size` and `LENGTH(content)` both non-zero and equal on all rows created after Phase 5.0.1 landed. Any NULL `content` is a legacy row from before the migration and is handled by the file-fallback path in the content route.
 
+**Test F — Phase 5.3 crash-recovery sweep:**
+
+Start a run, kill the worker mid-flight, restart, confirm sweep:
+
+    # 1. Kick off a long run
+    curl -sX POST http://127.0.0.1:3000/api/runs -H 'content-type: application/json' \
+      -d '{"input":{"prompt":"Write a 10-paragraph brief on quantum computing."}}'
+    # 2. Wait ~15s for worker to claim it (status='running', last_heartbeat set)
+    # 3. Kill the worker without letting it finalize
+    pkill -9 -f "worker/main.py"
+    # 4. Wait > STALE_HEARTBEAT_THRESHOLD_SECONDS (default 120s)
+    sleep 130
+    # 5. Restart worker
+    run-worker
+    # 6. Check the log — should see:
+    #    "swept N stale 'running' run(s) on startup: [<uuid>]"
+    # 7. Verify in DB
+    psql -U command -d evergreen_command -c \
+      "SELECT id, status, error_message FROM runs WHERE id = '<uuid>';"
+
+Expect: status='failed', error_message starts with "Worker crash detected: heartbeat stale".
+
+**Test G — Phase 5.3 live heartbeat:**
+
+Kick off any agent run and watch the heartbeat bump in real time:
+
+    # In one terminal, kick off a run that'll take > 30s
+    curl -sX POST ...
+    # In another, poll every 2s
+    watch -n 2 "psql -U command -d evergreen_command -tAc \
+      \"SELECT status, last_heartbeat, now() - last_heartbeat FROM runs ORDER BY created_at DESC LIMIT 1;\""
+
+Expect: `last_heartbeat` advances every ~10s while `status='running'`; gap `now() - last_heartbeat` stays < 20s.
+
 ---
 
 ## 13. Known gotchas
@@ -515,6 +601,7 @@ Expect: `content_size` and `LENGTH(content)` both non-zero and equal on all rows
 - **`current_run_id.get()` outside a run raises `LookupError`.** Tools must handle it explicitly — `write_brief` does.
 - **Filesystem state between processes is a liability.** Phase 5.0 tried to coordinate artifact storage between the Python worker (writes) and the Next.js app (reads) using shared disk paths. This broke immediately — the content endpoint returned 500 because the two processes had different views of the filesystem (different cwd, different env-resolved `ARTIFACTS_DIR`, different permissions). Phase 5.0.1 moved content into Postgres as a `TEXT` column and kept the file write only as a belt-and-suspenders backup. **Lesson: if state needs to cross a process boundary, put it in the database.** This is also why a single `pkill` + `run-worker` wasn't enough to pick up the Phase 5.0.1 fix on the first try — the worker's Python modules were already imported from the old code, and `evergreen restart` before `git checkout` meant the new code on disk was invisible to the running process until the next restart.
 - **Python imports are cached at process start, not on disk read.** If you edit a worker module and the change doesn't seem to land, verify the order: `git checkout` (or `git pull`) first, then `evergreen restart` (or `pkill -f worker/main.py && run-worker`). Restarting before updating the files on disk reloads the old code.
+- **Phase 5.3 heartbeat task is outside `execute_run`.** Don't inline it. The separation between `_run_with_heartbeat` (owns the task lifecycle) and `execute_run` (owns the business logic) exists so the §9 try/except topology stays untouched.
 
 ---
 
@@ -544,8 +631,8 @@ Chronological record of what landed when, with the commit that landed it.
 | 5.0   | Artifact viewer (list + preview)                            | shipped + hotfixed |  |
 | 5.0.1 | Artifact content in Postgres (`content TEXT` column)        | done      |           |
 | 5.1   | Task create/edit/delete/run UI                              | done      | `4b59ed4` |
-| 5.2   | Rendered `final_answer` hero panel on run detail            | pending   |           |
-| 5.3   | Worker crash recovery + heartbeat                           | pending   |           |
+| 5.2   | Rendered `final_answer` hero panel on run detail            | done      |           |
+| 5.3   | Worker crash recovery + heartbeat                           | shipped   |           |
 | 5.4   | Cooperative cancel wired through agent loop                 | pending   |           |
 | 6.0   | Second worker node + fast/slow model tiering                | pending   |           |
 | 6.1   | Remote access layer (FileBrowser + Tailscale primary, NCB secondary) | pending |   |
@@ -555,6 +642,8 @@ Chronological record of what landed when, with the commit that landed it.
 **Phase 5.0.1 shipped note:** the Phase 5.0 content endpoint 500 was caused by the web app and the worker having different views of `worker/artifacts/` on disk. We added `content TEXT` and `content_size INTEGER` columns to the `artifacts` table, taught `insert_artifact()` and `write_brief` to populate them, and rewrote `app/api/artifacts/[id]/content/route.ts` to read from the DB column first with the file path only as a legacy-row fallback. Smoke test: new artifact row showed `content_size=148` matching `LENGTH(content)=148`, content endpoint returned 200, preview rendered inline. Gotcha hit during rollout: the worker was restarted before `git checkout` so it imported the old Python code on disk — second restart picked up the fix. See §13 "Filesystem state between processes is a liability."
 
 **Phase 5.1 shipped note:** the `/tasks` page is now a fully interactive CRUD surface. Create/edit/delete/run all happen in-place via modals; the form covers the real seven-field schema (`name`, `description`, `prompt`, `systemPrompt`, `toolsAllowed[]`, `tags[]`, `inputSchema` as raw JSON); the run dialog parses `{{vars}}` from the prompt, renders one input per variable, and shows a live rendered preview before firing. Backed by a new `PATCH`/`DELETE` handler at `app/api/tasks/[id]/route.ts` (partial update: fields absent from the body stay put, `null` clears nullable columns, empty body rejected) and a shared `lib/prompt-template.ts` util so the client preview and the server-side render in `POST /api/runs` share the same regex. Server component + client island pattern: `app/tasks/page.tsx` stays a 27-line server component that queries Drizzle directly, `<TaskManager>` owns all modal state and calls `router.refresh()` after each mutation. Smoke tested end-to-end: create with `{{vars}}`, edit in place, run with live preview landing on `/runs/[id]`, delete with native `confirm()`, no-var task via "ready to fire" path, validation errors fire without API call. Commit `4b59ed4` via PR #1 squash merge. Note: ARCHITECTURE.md §3 `tasks` schema documentation had drift (old docs said `prompt_template` + `default_input`, real Drizzle schema has `prompt` + `system_prompt` + `tools_allowed[]` + `input_schema` + `tags[]`) — fixed in this same commit.
+
+**Phase 5.3 shipped note:** worker crash recovery + heartbeat landed. `runs.last_heartbeat` added via migration `0002_phase_5_3_heartbeat.sql` with a partial index `idx_runs_heartbeat ON runs(last_heartbeat) WHERE status='running'`. `worker/db.py` gained `update_heartbeat(run_id)` and `sweep_stale_runs(threshold_seconds)`; `claim_next_run` now stamps `last_heartbeat=now()` on claim so brand-new runs don't look stale for a full heartbeat interval. `worker/main.py` gained `_heartbeat_loop` (bumps every `HEARTBEAT_INTERVAL_SECONDS`, default 10s) and `_run_with_heartbeat` (wraps `execute_run` so the heartbeat task is cancelled on return) — kept separate from `execute_run` so the §9 try/except topology stays untouched. Startup sweeps any `running` row older than `STALE_HEARTBEAT_THRESHOLD_SECONDS` (default 120s, 12× the interval) to `failed` with `error_message='Worker crash detected: heartbeat stale (> 120s). Run swept on worker startup.'`. Smoke tests F and G in §12 document the kill-mid-run recovery path and the live-heartbeat observation path. Env knobs: `WORKER_HEARTBEAT_INTERVAL`, `WORKER_STALE_HEARTBEAT_THRESHOLD`. Known limitation: we only sweep on startup, not on a timer — a second live worker watching for another's death is a Phase 6.0 concern.
 
 ### Phase 6.1 block (parked — NCB / FileBrowser / remote access)
 
@@ -598,6 +687,7 @@ Patterns we've tried and rejected. Don't re-introduce these without reading the 
 - **Editing multi-line Python via nano paste.** See §13.
 - **Using regex patch scripts for one-line markdown edits.** See §13.
 - **Coordinating state across process boundaries via shared filesystem paths.** Phase 5.0 tried this for artifact content and it broke immediately. Put state that crosses a process boundary in the database. See §13.
+- **Inlining the heartbeat task into `execute_run`.** The separation between `_run_with_heartbeat` and `execute_run` is deliberate — keeps the §9 try/except topology untouched when the heartbeat story evolves.
 
 ---
 
@@ -632,6 +722,9 @@ Shutdown (clean):
 ## 19. Debugging journal
 
 Persistent notes from past incidents. Newest on top.
+
+**2026-04-13 — Phase 5.3 shipped, heartbeat + startup sweep**
+Added `runs.last_heartbeat` + partial index via migration `0002_phase_5_3_heartbeat.sql`. `claim_next_run` now stamps the column on claim; a new `_heartbeat_loop` in `worker/main.py` bumps it every 10s while a run is active; a new `sweep_stale_runs` runs once on worker startup to flip any `running` row older than 120s to `failed`. Chose to wrap the heartbeat task *around* `execute_run` via `_run_with_heartbeat` rather than inside — preserves the §9 try/except topology. Heartbeat failures are swallowed with a log line so a transient Postgres hiccup can't kill a running agent. Startup sweep failures are also swallowed so a sweep bug can't block new work. Smoke tests F + G (§12) documented. Known limitation: single-worker sweep only — a live worker cleaning up after another live worker is a Phase 6.0 concern once the second worker node exists.
 
 **2026-04-11 — Phase 5.0.1 shipped, first smoke test caught a stale-import trap**
 Phase 5.0 shipped with a content endpoint 500 because the web app and the worker disagreed about where `worker/artifacts/*.md` lived on disk. Fix: added `content TEXT` and `content_size INTEGER` columns to the `artifacts` table, taught `insert_artifact` + `write_brief` to populate them, rewrote the content route to `SELECT content FROM artifacts WHERE id = $1` with a legacy file fallback only for rows where `content IS NULL`. First smoke test after rollout still returned NULL content — root cause was `evergreen restart` having been run before `git checkout phase-5.0.1-artifacts-in-db`, so the worker's Python modules were cached from the old code. Second restart picked up the fix cleanly. New artifact row: `content_size=148`, `LENGTH(content)=148`, content endpoint 200. Filed §13 gotcha "Filesystem state between processes is a liability" and §13 "Python imports are cached at process start."
