@@ -1,4 +1,4 @@
-"""Evergreen Command worker — Phase 3B.
+"""Evergreen Command worker — Phase 3B + 5.3.
 
 Polls the `runs` table for pending work, claims one row at a time, and
 branches on the shape of run.input:
@@ -7,6 +7,12 @@ branches on the shape of run.input:
 - `{"tool_calls": [{name, arguments}, ...]}`        → literal mode (Phase 3A regression)
 
 Either way, writes tool_calls + logs rows as it goes and finalizes the run.
+
+Phase 5.3 additions:
+- On startup, sweep_stale_runs flips crashed rows to 'failed'.
+- While a run is executing, a background heartbeat task bumps
+  runs.last_heartbeat every HEARTBEAT_INTERVAL_SECONDS so the next
+  sweep can identify crashed workers.
 
 Run:
     python main.py
@@ -34,6 +40,8 @@ from db import (
     finalize_run_success,
     insert_tool_call,
     open_pool,
+    sweep_stale_runs,
+    update_heartbeat,
     write_log,
 )
 from tools.echo import EchoTool
@@ -222,11 +230,53 @@ async def execute_run(run: asyncpg.Record) -> None:
         current_run_id.reset(token)
 
 
+# --- heartbeat task (Phase 5.3) ---------------------------------------------
+async def _heartbeat_loop(run_id: UUID) -> None:
+    """Bump runs.last_heartbeat every HEARTBEAT_INTERVAL_SECONDS.
+
+    Runs as a background task alongside execute_run. Cancelled in the
+    `finally` of _run_with_heartbeat once the run terminates.
+    """
+    try:
+        while True:
+            await asyncio.sleep(config.HEARTBEAT_INTERVAL_SECONDS)
+            try:
+                await update_heartbeat(run_id)
+            except Exception:
+                # Never let a heartbeat failure kill the run — just log it.
+                log.exception("heartbeat update failed for run %s", run_id)
+    except asyncio.CancelledError:
+        # Expected path: the run finished and _run_with_heartbeat cancelled us.
+        raise
+
+
+async def _run_with_heartbeat(run: asyncpg.Record) -> None:
+    """Execute a run with a concurrent heartbeat task.
+
+    Kept separate from execute_run so we don't perturb execute_run's
+    try/except/finally topology (see ARCHITECTURE.md §9).
+    """
+    hb_task = asyncio.create_task(_heartbeat_loop(run["id"]))
+    try:
+        await execute_run(run)
+    finally:
+        hb_task.cancel()
+        try:
+            await hb_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("heartbeat task raised on shutdown for run %s", run["id"])
+
+
 # --- main loop ---------------------------------------------------------------
 async def poll_loop() -> None:
     log.info(
-        "worker started. poll_interval=%.1fs tools=%s llm=%s model=%s",
+        "worker started. poll_interval=%.1fs heartbeat=%.1fs stale_threshold=%.1fs "
+        "tools=%s llm=%s model=%s",
         config.POLL_INTERVAL_SECONDS,
+        config.HEARTBEAT_INTERVAL_SECONDS,
+        config.STALE_HEARTBEAT_THRESHOLD_SECONDS,
         registry.names,
         config.LLM_BASE_URL,
         config.LLM_MODEL,
@@ -248,7 +298,7 @@ async def poll_loop() -> None:
                 pass
             continue
 
-        await execute_run(run)
+        await _run_with_heartbeat(run)
 
     log.info("poll loop exiting")
 
@@ -260,6 +310,23 @@ async def main() -> None:
 
     await open_pool()
     try:
+        # Phase 5.3: sweep stale 'running' rows left behind by a crashed
+        # worker before we start polling for new work.
+        try:
+            stale_ids = await sweep_stale_runs(
+                config.STALE_HEARTBEAT_THRESHOLD_SECONDS
+            )
+            if stale_ids:
+                log.warning(
+                    "swept %d stale 'running' run(s) on startup: %s",
+                    len(stale_ids),
+                    [str(r) for r in stale_ids],
+                )
+            else:
+                log.info("no stale runs to sweep on startup")
+        except Exception:
+            log.exception("startup sweep_stale_runs failed; continuing anyway")
+
         await poll_loop()
     finally:
         await close_pool()

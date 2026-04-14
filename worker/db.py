@@ -3,6 +3,7 @@
 Responsibilities:
 - Pool lifecycle (open/close) with JSONB type codec
 - claim_next_run: atomic FOR UPDATE SKIP LOCKED fetch + flip to 'running'
+- update_heartbeat / sweep_stale_runs: Phase 5.3 crash-recovery primitives
 - insert_tool_call / complete_tool_call / fail_tool_call: tool execution rows
 - insert_artifact: artifact rows (briefs, reports, etc)
 - write_log: append a structured row to the `logs` table
@@ -63,6 +64,11 @@ async def claim_next_run() -> Optional[asyncpg.Record]:
 
     Returns the run row or None if no pending runs exist.
     Safe for concurrent workers thanks to FOR UPDATE SKIP LOCKED.
+
+    Phase 5.3: also stamps last_heartbeat = now() so the row has a fresh
+    timestamp immediately — otherwise the first heartbeat wouldn't fire
+    for HEARTBEAT_INTERVAL_SECONDS and a crashed-at-start run would look
+    stale for way too long.
     """
     assert _pool is not None, "pool not opened"
     async with _pool.acquire() as conn:
@@ -82,12 +88,80 @@ async def claim_next_run() -> Optional[asyncpg.Record]:
             await conn.execute(
                 """
                 UPDATE runs
-                SET status = 'running', started_at = now()
+                SET status = 'running',
+                    started_at = now(),
+                    last_heartbeat = now()
                 WHERE id = $1
                 """,
                 row["id"],
             )
             return row
+
+
+async def update_heartbeat(run_id: UUID) -> None:
+    """Bump last_heartbeat for an active run.
+
+    Called every HEARTBEAT_INTERVAL_SECONDS from the background heartbeat
+    task in main.py. The WHERE clause limits the write to 'running' rows
+    so a late heartbeat can't clobber a run that already terminated.
+    """
+    assert _pool is not None
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE runs
+            SET last_heartbeat = now()
+            WHERE id = $1 AND status = 'running'
+            """,
+            run_id,
+        )
+
+
+async def sweep_stale_runs(threshold_seconds: float) -> list[UUID]:
+    """Flip any 'running' rows with a stale heartbeat to 'failed'.
+
+    Called once on worker startup. Catches two failure modes:
+      1. A previous worker crashed mid-run and never finalized the row.
+      2. A run is truly stuck and will never heartbeat again.
+
+    Rows with NULL last_heartbeat are also swept if their started_at is
+    older than the threshold — that covers rows claimed by a pre-Phase-5.3
+    worker that never wrote a heartbeat.
+
+    Returns the list of ids that were flipped so main.py can log them.
+
+    Implementation note: we bind the threshold as a float8 and multiply
+    by `interval '1 second'`. An earlier version used `$1::text` +
+    `|| ' seconds'::interval` but asyncpg won't auto-cast a Python float
+    to text at bind time ("expected str, got float"). Keeping the
+    error_message formatting in Python also lets the query take a
+    single parameter, which is easier to reason about.
+    """
+    assert _pool is not None
+    error_message = (
+        f"Worker crash detected: heartbeat stale (> {threshold_seconds:g}s). "
+        f"Run swept on worker startup."
+    )
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            UPDATE runs
+            SET status = 'failed',
+                error_message = $2,
+                finished_at = now()
+            WHERE status = 'running'
+              AND (
+                (last_heartbeat IS NOT NULL
+                   AND last_heartbeat < now() - ($1 * interval '1 second'))
+                OR (last_heartbeat IS NULL
+                   AND started_at < now() - ($1 * interval '1 second'))
+              )
+            RETURNING id
+            """,
+            threshold_seconds,
+            error_message,
+        )
+        return [r["id"] for r in rows]
 
 
 async def finalize_run_success(

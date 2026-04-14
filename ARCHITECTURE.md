@@ -12,7 +12,7 @@ This doc is the source of truth for "how does this thing actually work on this b
 
 Day-to-day operations, copy-paste ready.
 
-Start the web app (Next.js 15, dev mode):
+Start the web app (Next.js 15, dev mode, port 3015):
 
     cd /home/lynf/evergreen-command-claw && npm run dev
 
@@ -24,6 +24,12 @@ Start the LLM server (llama.cpp + Nemotron 120B on port 8081):
 
     run-agent
 
+Or start / stop / inspect the whole stack (web + worker + LLM) via the `evergreen` CLI — see §11:
+
+    evergreen restart          # all three processes, clean
+    evergreen status           # what's running, on what ports
+    evergreen stop             # graceful shutdown
+
 Tail the worker log:
 
     tail -F /home/lynf/evergreen-command-claw/worker.log
@@ -32,19 +38,26 @@ Kill the worker cleanly:
 
     pkill -f "worker/main.py"
 
-Psql into the app DB:
+Psql into the app DB (Postgres runs in Docker on this box — user is `command`, not `evergreen`):
 
-    psql -U evergreen -d evergreen_command
+    docker exec -it evergreen-command-db psql -U command -d evergreen_command
+
+One-shot queries:
+
+    docker exec -i evergreen-command-db psql -U command -d evergreen_command \
+      -c "SELECT id, status FROM runs ORDER BY created_at DESC LIMIT 5;"
 
 Quick run status via API:
 
-    curl -s http://127.0.0.1:3000/api/runs | jq '.[0:3]'
+    curl -s http://127.0.0.1:3015/api/runs | jq '.[0:3]'
 
 Kick a smoke-test run (agent mode, prompt in body):
 
-    curl -sX POST http://127.0.0.1:3000/api/runs \
+    curl -sX POST http://127.0.0.1:3015/api/runs \
       -H 'content-type: application/json' \
       -d '{"input":{"prompt":"Write a one-paragraph brief on llama.cpp speculative decoding."}}'
+
+Note: routes under `/api/*` (other than `/api/v1/*` and `/api/auth/*`) are gated by the `ev-session` cookie auth middleware — see §7 for the bypass trick used for local smoke testing.
 
 ---
 
@@ -52,10 +65,10 @@ Kick a smoke-test run (agent mode, prompt in body):
 
 Three long-lived processes, one database, one filesystem artifact dir.
 
-- **Web app (Next.js 15)** — `npm run dev` on port 3000. Serves the UI (`app/`) and API routes (`app/api/*`). Talks to Postgres via Drizzle. Reads `worker/artifacts/` for Phase 5.0 artifact display.
+- **Web app (Next.js 15)** — `npm run dev` on port **3015** (set by `package.json` → `"dev": "next dev --turbopack --port 3015"`). Serves the UI (`app/`) and API routes (`app/api/*`). Talks to Postgres via Drizzle. Reads `worker/artifacts/` for Phase 5.0 artifact display.
 - **Worker (Python 3)** — `worker/main.py`, long-running asyncio loop. Claims rows from `runs` where `status='pending'`, executes them (agent mode or literal tool-call mode), writes results back. Talks to Postgres via `asyncpg` and to the LLM via `httpx` against `LLM_BASE_URL`.
 - **LLM server (llama.cpp)** — `run-agent` shell helper wraps llama.cpp in OpenAI-compatible mode serving `nemotron-3-super-120b-a12b` on `http://127.0.0.1:8081`. The worker speaks OpenAI chat-completions to it.
-- **Postgres** — local cluster, DB `evergreen_command`, user `evergreen`. Schema owned by Drizzle migrations in `drizzle/`.
+- **Postgres** — runs in Docker (container `evergreen-command-db`). DB `evergreen_command`, user `command`. Schema owned by Drizzle migrations in `drizzle/`.
 - **Filesystem artifacts** — `worker/artifacts/*.md` is where `write_brief` drops files. Also the read path for the artifact viewer.
 
 Dataflow per run: UI → POST `/api/runs` → insert row `status=pending` → worker `claim_next_run()` (FOR UPDATE SKIP LOCKED) → execute → `finalize_run_success` → UI polls / SSE streams logs.
@@ -77,12 +90,14 @@ Dataflow per run: UI → POST `/api/runs` → insert row `status=pending` → wo
     │   │   └── artifacts/                  # Phase 5.0 (pending)
     │   ├── runs/[id]/page.tsx              # run detail view
     │   └── tasks/page.tsx                  # task list
+    ├── middleware.ts                       # ev-session cookie auth gate (§7)
     ├── lib/
     │   ├── db/                             # Drizzle client + schema
     │   ├── hooks/use-run-logs.ts           # SSE hook with id-based dedup
     │   └── prompt-template.ts              # {{var}} substitution
     ├── drizzle/
-    │   └── 0000_complete_bucky.sql         # initial migration
+    │   ├── 0000_complete_bucky.sql         # initial migration
+    │   └── 0002_phase_5_3_heartbeat.sql    # Phase 5.3 heartbeat column + index
     ├── worker/
     │   ├── main.py                         # claim loop, execute_run dispatcher
     │   ├── agent.py                        # run_agent() iteration loop
@@ -144,6 +159,7 @@ Every execution, agent-mode or literal-mode.
 - `tokens_per_sec real`
 - `started_at timestamp`
 - `finished_at timestamp`
+- `last_heartbeat timestamp` — **Phase 5.3:** bumped every `HEARTBEAT_INTERVAL_SECONDS` by the worker while a run is active. On worker startup, rows where `status='running'` and `last_heartbeat < now() - STALE_HEARTBEAT_THRESHOLD_SECONDS` get swept to `failed`. Partial index `idx_runs_heartbeat ON runs(last_heartbeat) WHERE status='running'` keeps the sweep cheap.
 - `created_at timestamp default now() NOT NULL`
 
 ### `run_logs`
@@ -186,7 +202,19 @@ Every DB write goes through this module. If you're writing raw SQL outside it yo
 
     async def claim_next_run() -> Optional[dict]
         # SELECT ... FOR UPDATE SKIP LOCKED, flips status='running',
-        # sets started_at=now(). Returns full row dict or None.
+        # sets started_at=now() AND last_heartbeat=now() (Phase 5.3).
+        # Returns full row dict or None.
+
+    async def update_heartbeat(run_id: UUID) -> None
+        # Phase 5.3. Bumps last_heartbeat=now() for a 'running' row.
+        # WHERE clause guards against clobbering a terminal row.
+
+    async def sweep_stale_runs(threshold_seconds: float) -> list[UUID]
+        # Phase 5.3. Called once on worker startup. Flips any 'running'
+        # row whose last_heartbeat is older than threshold_seconds to
+        # 'failed' with a diagnostic error_message. Also sweeps rows
+        # with NULL last_heartbeat and a stale started_at (pre-5.3
+        # claims). Returns the list of ids swept.
 
     async def finalize_run_success(
         run_id: UUID,
@@ -226,7 +254,7 @@ Every DB write goes through this module. If you're writing raw SQL outside it yo
         content_size: Optional[int] = None,      # Phase 5.0.1
     ) -> UUID
 
-    # TODO: cancel_run(run_id), reset_stale_running_rows() — sign before Phase 5.3
+    # TODO: cancel_run(run_id) — Phase 5.4
 
 ---
 
@@ -236,7 +264,29 @@ Every DB write goes through this module. If you're writing raw SQL outside it yo
 
 1. `open_pool()` — asyncpg pool against `evergreen_command`.
 2. Register tools into `ToolRegistry`.
-3. Enter the claim loop: `while True: run = await claim_next_run(); if run: await execute_run(run); else: await asyncio.sleep(poll_interval)`.
+3. **Phase 5.3:** `sweep_stale_runs(STALE_HEARTBEAT_THRESHOLD_SECONDS)` once — flips any `status='running'` rows with stale heartbeats to `failed` before we start taking new work. Logs the count + ids. A failure here is swallowed (logged only) so a sweep bug can't block the worker from coming up.
+4. Enter the claim loop: `while True: run = await claim_next_run(); if run: await _run_with_heartbeat(run); else: await asyncio.sleep(poll_interval)`.
+
+`_run_with_heartbeat(run)` (Phase 5.3 wrapper):
+
+    hb_task = asyncio.create_task(_heartbeat_loop(run["id"]))
+    try:
+        await execute_run(run)
+    finally:
+        hb_task.cancel()
+        try: await hb_task
+        except asyncio.CancelledError: pass
+
+The wrapper is deliberately separate from `execute_run` so the inner try/except/finally topology stays untouched (see §9).
+
+`_heartbeat_loop(run_id)`:
+
+    while True:
+        await asyncio.sleep(config.HEARTBEAT_INTERVAL_SECONDS)
+        try:
+            await update_heartbeat(run_id)
+        except Exception:
+            log.exception(...)           # never kill the run on a hb failure
 
 `execute_run(run)`:
 
@@ -276,7 +326,20 @@ Every DB write goes through this module. If you're writing raw SQL outside it yo
 
 **Indent drift is the silent killer here.** The `if result["output"].get("error") == "max_iterations_exceeded"` branch MUST live inside the `try` block at the same indent as the `finalize_run_success` call. When editing this, use a regex-based patch script, not nano paste.
 
-**Crash recovery:** TODO — on worker startup, sweep `status='running'` rows older than N minutes back to pending or failed. Not implemented yet. Heartbeat on the run row also TODO.
+### Crash-recovery policy (Phase 5.3)
+
+The system assumes one worker at a time. If it crashes, rows it was executing get stuck at `status='running'` — the UI sees them as active forever and the claim loop can't notice because `FOR UPDATE SKIP LOCKED` only touches `pending` rows.
+
+The policy:
+
+- **Heartbeat cadence.** While a run is active, a background asyncio task (started in `_run_with_heartbeat`, cancelled when `execute_run` returns) writes `runs.last_heartbeat = now()` every `HEARTBEAT_INTERVAL_SECONDS` (default 10s).
+- **Stale threshold.** Default `STALE_HEARTBEAT_THRESHOLD_SECONDS = 120s` — 12× the heartbeat interval. Any `running` row whose last heartbeat is older than this is presumed dead.
+- **Startup sweep.** `sweep_stale_runs(threshold)` runs once before the poll loop starts. It flips dead rows to `failed` with `error_message = 'Worker crash detected: heartbeat stale (> 120s). Run swept on worker startup.'` and returns the id list for logging. Null-heartbeat rows with a stale `started_at` are also swept — covers pre-5.3 claims from before the column existed.
+- **No mid-run sweep.** We only sweep on startup. A live worker never cleans up after another live worker — that's a multi-worker concern slated for Phase 6.0.
+- **Output preserved on sweep.** Sweep uses the same UPDATE shape as `finalize_run_failure` — it only touches `status`, `error_message`, `finished_at`. Any partial `output` or token counts stay intact.
+- **Heartbeat failures don't kill the run.** If Postgres is briefly unavailable, the heartbeat task logs and keeps trying. The agent loop keeps running. Worst case: the next sweep may kill a live run that fell behind on heartbeats for >2 min — acceptable given this is a single-worker dev system.
+
+Tuning knobs: `WORKER_HEARTBEAT_INTERVAL` and `WORKER_STALE_HEARTBEAT_THRESHOLD` in `.env.local`. Both read at import time in `config.py` — restart the worker after changing them.
 
 ---
 
@@ -390,6 +453,27 @@ All under `app/api/`.
 - `GET /api/runs/[id]/artifacts` — list artifacts for a run (Phase 5.0).
 - `GET /api/artifacts/[id]/content` — fetch artifact body. **Phase 5.0.1:** reads from `artifacts.content` column first (happy path), falls back to `file_path` on disk only for legacy rows where `content IS NULL`. The fallback exists only so old runs from before the migration still render — new runs never touch disk on read.
 
+### Auth middleware
+
+`middleware.ts` at the repo root gates every route behind an `ev-session` cookie. The matcher excludes `/_next/static`, `/_next/image`, and `/favicon.ico`; everything else runs through the middleware.
+
+Public paths that bypass the cookie check (the middleware `next()`s early):
+
+- `/login` — the sign-in page itself
+- `/api/auth/*` — login/logout endpoints that issue / clear the cookie
+- `/_next/*` — Next.js internals
+- `/favicon*`
+- `/api/v1/*` — external API surface. These routes are expected to authenticate per-handler via API key header instead of cookie. The middleware deliberately does not enforce any check for `/api/v1`.
+
+Any other path without a valid `ev-session` cookie gets a 307 redirect to `/login`. This includes `/api/runs`, `/api/tasks`, `/api/artifacts/*` — so a naked `curl -X POST http://127.0.0.1:3015/api/runs` from the box will return `HTTP/1.1 307` with `location: /login`, not create a run.
+
+**Smoke-test bypass.** For local testing without logging in through the UI, insert the run row directly:
+
+    docker exec -i evergreen-command-db psql -U command -d evergreen_command \
+      -c "INSERT INTO runs (input) VALUES ('{\"prompt\":\"one sentence on llama.cpp\"}'::jsonb) RETURNING id;"
+
+The worker polls the `runs` table regardless of how the row got there, so the heartbeat + claim + execute path is exercised exactly as it would be from a real UI-initiated run. This is how Test G in §12 was validated.
+
 ---
 
 ## 8. Environment variables
@@ -407,6 +491,8 @@ Required:
 Optional:
 
 - `WORKER_POLL_INTERVAL_SEC` — claim loop sleep between empty polls.
+- `WORKER_HEARTBEAT_INTERVAL` — **Phase 5.3:** seconds between heartbeat writes, default `10.0`.
+- `WORKER_STALE_HEARTBEAT_THRESHOLD` — **Phase 5.3:** seconds after which a `running` row's heartbeat is considered stale and sweepable, default `120.0`.
 - `WEB_SEARCH_PROVIDER`, `WEB_SEARCH_API_KEY` — TODO audit.
 
 ---
@@ -429,6 +515,8 @@ Three places where exceptions can land. Getting the indent wrong here is how you
 
 Rule: **any edit to `execute_run` uses a regex patch script, never nano paste.** Nano paste drops or adds whitespace invisibly when bracketed-paste mode is mismatched.
 
+**Phase 5.3 note:** the heartbeat task lives in `_run_with_heartbeat`, *outside* `execute_run`. Keep it that way. Adding a try/finally to `execute_run` to cancel the heartbeat task would be the exact kind of edit that introduces silent indent drift.
+
 Verify before restart:
 
     python3 -m py_compile worker/main.py worker/agent.py
@@ -441,8 +529,8 @@ If that's clean, restart. If not, fix first.
 
 - **Worker stdout/stderr** → `worker.log` (via `run-worker` redirect)
 - **llama.cpp stdout/stderr** → `agent.log` (via `run-agent` redirect)
-- **Next.js dev** → terminal where `npm run dev` runs
-- **Postgres** → `/var/log/postgresql/` (system default)
+- **Next.js dev** → terminal where `npm run dev` runs (or `evergreen attach` for the multiplexed view)
+- **Postgres** → inside the `evergreen-command-db` container (`docker logs evergreen-command-db`)
 - **Per-run structured logs** → `run_logs` table, streamed via `/api/runs/[id]/logs`
 
 ---
@@ -456,15 +544,32 @@ Under `~/bin/`, on PATH.
 
 Both are idempotent-ish — they don't check for existing processes, so `pkill` before restart if you want to be sure.
 
+### `evergreen` CLI
+
+Wraps the three processes (web + worker + LLM) under a single tmux-backed supervisor. Use this for day-to-day ops rather than starting the processes by hand.
+
+    evergreen start              # bring the stack up (idempotent-ish — see note)
+    evergreen restart            # clean stop + start; the canonical "pick up new code"
+    evergreen stop               # graceful shutdown of all three processes
+    evergreen status             # shows what's running, PIDs, ports
+    evergreen attach             # attaches to the tmux session for multiplexed logs
+
+Behavior notes:
+
+- `evergreen restart` starts the web dev server on **:3015**, the worker against the Docker-hosted Postgres, and the llama.cpp server on :8081. Running `npm run dev` on top of an already-running `evergreen` session will crash with `EADDRINUSE` — either attach to the running session or `evergreen stop` first.
+- `evergreen restart` is the right move after `git pull` / `git checkout` so the worker picks up new Python code. Restarting *before* updating the files on disk reloads old code (see §13).
+- `evergreen attach` multiplexes all three logs; detach with the usual tmux prefix (`Ctrl-b d`). The session keeps running in the background.
+- For worker-only restarts (e.g. after tweaking heartbeat knobs in `.env.local`), `pkill -f "worker/main.py" && run-worker` is faster than a full `evergreen restart`.
+
 ---
 
 ## 12. Smoke test recipes
 
-All assume the three processes are up.
+All assume the three processes are up. `/api/runs` is cookie-gated (§7) — either log in via the UI first (so your shell's curl has the cookie jar), or use the psql-direct-insert bypass (§7) for headless tests.
 
 **Test A — agent mode, no tools:**
 
-    curl -sX POST http://127.0.0.1:3000/api/runs \
+    curl -sX POST http://127.0.0.1:3015/api/runs \
       -H 'content-type: application/json' \
       -d '{"input":{"prompt":"In one sentence, what is speculative decoding?"}}'
 
@@ -472,7 +577,7 @@ Expect: single iteration, no tool calls, `status=succeeded`, final_answer popula
 
 **Test B — agent mode, forced write_brief:**
 
-    curl -sX POST http://127.0.0.1:3000/api/runs \
+    curl -sX POST http://127.0.0.1:3015/api/runs \
       -H 'content-type: application/json' \
       -d '{"input":{"prompt":"Write a 3-paragraph brief on llama.cpp speculative decoding. Use the write_brief tool to save it."}}'
 
@@ -480,7 +585,7 @@ Expect: at least 1 tool call, 1 row in `artifacts`, 1 `.md` file in `worker/arti
 
 **Test C — literal tool-call mode:**
 
-    curl -sX POST http://127.0.0.1:3000/api/runs \
+    curl -sX POST http://127.0.0.1:3015/api/runs \
       -H 'content-type: application/json' \
       -d '{"input":{"tool_calls":[{"name":"write_brief","arguments":{"title":"test","content":"hello"}}]}}'
 
@@ -488,7 +593,7 @@ Expect: bypass LLM, tool dispatched directly, artifact registered.
 
 **Test D — adversarial max-iterations (Phase 4.5 budget validation):**
 
-    curl -sX POST http://127.0.0.1:3000/api/runs \
+    curl -sX POST http://127.0.0.1:3015/api/runs \
       -H 'content-type: application/json' \
       -d '{"input":{"prompt":"Research the history of the Roman Empire exhaustively. Make at least 25 tool calls before answering."}}'
 
@@ -500,6 +605,41 @@ Expect: budget notice at iter 15 (remaining≤5), hard stop at iter 18 (remainin
       -c "SELECT id, name, content_size, LENGTH(content) FROM artifacts ORDER BY created_at DESC LIMIT 5;"
 
 Expect: `content_size` and `LENGTH(content)` both non-zero and equal on all rows created after Phase 5.0.1 landed. Any NULL `content` is a legacy row from before the migration and is handled by the file-fallback path in the content route.
+
+**Test F — Phase 5.3 crash-recovery sweep:**
+
+Start a run, kill the worker mid-flight, restart, confirm sweep. Uses the psql-direct-insert bypass (§7) to avoid the cookie gate:
+
+    # 1. Insert a run directly (bypasses auth middleware)
+    docker exec -i evergreen-command-db psql -U command -d evergreen_command \
+      -c "INSERT INTO runs (input) VALUES ('{\"prompt\":\"Write a 10-paragraph brief on quantum computing.\"}'::jsonb) RETURNING id;"
+    # 2. Wait ~15s for worker to claim it (status='running', last_heartbeat set)
+    # 3. Kill the worker without letting it finalize
+    pkill -9 -f "worker/main.py"
+    # 4. Wait > STALE_HEARTBEAT_THRESHOLD_SECONDS (default 120s)
+    sleep 130
+    # 5. Restart worker
+    run-worker          # or: evergreen restart
+    # 6. Check the log — should see:
+    #    "swept N stale 'running' run(s) on startup: [<uuid>]"
+    # 7. Verify in DB
+    docker exec -i evergreen-command-db psql -U command -d evergreen_command \
+      -c "SELECT id, status, error_message FROM runs WHERE id = '<uuid>';"
+
+Expect: status='failed', error_message starts with "Worker crash detected: heartbeat stale".
+
+**Test G — Phase 5.3 live heartbeat:**
+
+Kick off any agent run and watch the heartbeat bump in real time:
+
+    # Terminal 1 — insert via psql to bypass cookie auth
+    docker exec -i evergreen-command-db psql -U command -d evergreen_command \
+      -c "INSERT INTO runs (input) VALUES ('{\"prompt\":\"Explain speculative decoding in 5 paragraphs.\"}'::jsonb) RETURNING id;"
+    # Terminal 2 — poll every 2s
+    watch -n 2 "docker exec -i evergreen-command-db psql -U command -d evergreen_command -tAc \
+      \"SELECT status, last_heartbeat, now() - last_heartbeat FROM runs ORDER BY created_at DESC LIMIT 1;\""
+
+Expect: `last_heartbeat` advances every ~10s while `status='running'`; gap `now() - last_heartbeat` stays < 20s.
 
 ---
 
@@ -515,6 +655,10 @@ Expect: `content_size` and `LENGTH(content)` both non-zero and equal on all rows
 - **`current_run_id.get()` outside a run raises `LookupError`.** Tools must handle it explicitly — `write_brief` does.
 - **Filesystem state between processes is a liability.** Phase 5.0 tried to coordinate artifact storage between the Python worker (writes) and the Next.js app (reads) using shared disk paths. This broke immediately — the content endpoint returned 500 because the two processes had different views of the filesystem (different cwd, different env-resolved `ARTIFACTS_DIR`, different permissions). Phase 5.0.1 moved content into Postgres as a `TEXT` column and kept the file write only as a belt-and-suspenders backup. **Lesson: if state needs to cross a process boundary, put it in the database.** This is also why a single `pkill` + `run-worker` wasn't enough to pick up the Phase 5.0.1 fix on the first try — the worker's Python modules were already imported from the old code, and `evergreen restart` before `git checkout` meant the new code on disk was invisible to the running process until the next restart.
 - **Python imports are cached at process start, not on disk read.** If you edit a worker module and the change doesn't seem to land, verify the order: `git checkout` (or `git pull`) first, then `evergreen restart` (or `pkill -f worker/main.py && run-worker`). Restarting before updating the files on disk reloads the old code.
+- **Phase 5.3 heartbeat task is outside `execute_run`.** Don't inline it. The separation between `_run_with_heartbeat` (owns the task lifecycle) and `execute_run` (owns the business logic) exists so the §9 try/except topology stays untouched.
+- **curl against `/api/*` returns 307 to `/login`.** The `ev-session` cookie middleware (§7) gates everything except `/api/auth/*` and `/api/v1/*`. For headless smoke tests, insert the `runs` row directly via psql — the worker polls the table regardless of who wrote the row.
+- **Dev port is 3015, not 3000.** `package.json` sets `"dev": "next dev --turbopack --port 3015"`. Curling `:3000` on this box will either hit nothing or hit a different FastAPI process.
+- **Postgres lives in Docker.** The DB user is `command`, not `evergreen`; connect via `docker exec -i evergreen-command-db psql -U command -d evergreen_command`. There is no local `psql` client installed.
 
 ---
 
@@ -544,8 +688,8 @@ Chronological record of what landed when, with the commit that landed it.
 | 5.0   | Artifact viewer (list + preview)                            | shipped + hotfixed |  |
 | 5.0.1 | Artifact content in Postgres (`content TEXT` column)        | done      |           |
 | 5.1   | Task create/edit/delete/run UI                              | done      | `4b59ed4` |
-| 5.2   | Rendered `final_answer` hero panel on run detail            | pending   |           |
-| 5.3   | Worker crash recovery + heartbeat                           | pending   |           |
+| 5.2   | Rendered `final_answer` hero panel on run detail            | done      |           |
+| 5.3   | Worker crash recovery + heartbeat                           | shipped   |           |
 | 5.4   | Cooperative cancel wired through agent loop                 | pending   |           |
 | 6.0   | Second worker node + fast/slow model tiering                | pending   |           |
 | 6.1   | Remote access layer (FileBrowser + Tailscale primary, NCB secondary) | pending |   |
@@ -556,6 +700,8 @@ Chronological record of what landed when, with the commit that landed it.
 
 **Phase 5.1 shipped note:** the `/tasks` page is now a fully interactive CRUD surface. Create/edit/delete/run all happen in-place via modals; the form covers the real seven-field schema (`name`, `description`, `prompt`, `systemPrompt`, `toolsAllowed[]`, `tags[]`, `inputSchema` as raw JSON); the run dialog parses `{{vars}}` from the prompt, renders one input per variable, and shows a live rendered preview before firing. Backed by a new `PATCH`/`DELETE` handler at `app/api/tasks/[id]/route.ts` (partial update: fields absent from the body stay put, `null` clears nullable columns, empty body rejected) and a shared `lib/prompt-template.ts` util so the client preview and the server-side render in `POST /api/runs` share the same regex. Server component + client island pattern: `app/tasks/page.tsx` stays a 27-line server component that queries Drizzle directly, `<TaskManager>` owns all modal state and calls `router.refresh()` after each mutation. Smoke tested end-to-end: create with `{{vars}}`, edit in place, run with live preview landing on `/runs/[id]`, delete with native `confirm()`, no-var task via "ready to fire" path, validation errors fire without API call. Commit `4b59ed4` via PR #1 squash merge. Note: ARCHITECTURE.md §3 `tasks` schema documentation had drift (old docs said `prompt_template` + `default_input`, real Drizzle schema has `prompt` + `system_prompt` + `tools_allowed[]` + `input_schema` + `tags[]`) — fixed in this same commit.
 
+**Phase 5.3 shipped note:** worker crash recovery + heartbeat landed. `runs.last_heartbeat` added via migration `0002_phase_5_3_heartbeat.sql` with a partial index `idx_runs_heartbeat ON runs(last_heartbeat) WHERE status='running'`. `worker/db.py` gained `update_heartbeat(run_id)` and `sweep_stale_runs(threshold_seconds)`; `claim_next_run` now stamps `last_heartbeat=now()` on claim so brand-new runs don't look stale for a full heartbeat interval. `worker/main.py` gained `_heartbeat_loop` (bumps every `HEARTBEAT_INTERVAL_SECONDS`, default 10s) and `_run_with_heartbeat` (wraps `execute_run` so the heartbeat task is cancelled on return) — kept separate from `execute_run` so the §9 try/except topology stays untouched. Startup sweeps any `running` row older than `STALE_HEARTBEAT_THRESHOLD_SECONDS` (default 120s, 12× the interval) to `failed` with `error_message='Worker crash detected: heartbeat stale (> 120s). Run swept on worker startup.'`. Smoke tests F and G in §12 document the kill-mid-run recovery path and the live-heartbeat observation path. Env knobs: `WORKER_HEARTBEAT_INTERVAL`, `WORKER_STALE_HEARTBEAT_THRESHOLD`. Known limitation: we only sweep on startup, not on a timer — a second live worker watching for another's death is a Phase 6.0 concern.
+
 ### Phase 6.1 block (parked — NCB / FileBrowser / remote access)
 
 The goal of Phase 6.1 is to make Evergreen Command usable from outside the house LAN — from a phone, a laptop at a coffee shop, or from a teammate's machine — without exposing the Framestation directly to the public internet.
@@ -563,7 +709,7 @@ The goal of Phase 6.1 is to make Evergreen Command usable from outside the house
 **Primary path — self-hosted:**
 
 - **FileBrowser** on the Framestation for artifact browsing and direct file downloads, behind basic auth.
-- **Tailscale** for the network layer — everyone in the ops circle joins the tailnet, FileBrowser and the Next.js app are reachable over MagicDNS at `framerbox395.tail-scale-name.ts.net:3000` (or whatever the assigned name is). No port forwarding, no public DNS.
+- **Tailscale** for the network layer — everyone in the ops circle joins the tailnet, FileBrowser and the Next.js app are reachable over MagicDNS at `framerbox395.tail-scale-name.ts.net:3015` (or whatever the assigned name is). No port forwarding, no public DNS.
 - Next.js app and the Postgres admin port stay bound to `127.0.0.1` on the Framestation; Tailscale ACLs decide who can reach them.
 - Belt-and-suspenders: a spare NoCodeBackend project as a warm mirror for artifacts, using the existing lifetime subscription. This is the "laptop dies in the field, need to hand someone a URL" lever.
 
@@ -598,31 +744,47 @@ Patterns we've tried and rejected. Don't re-introduce these without reading the 
 - **Editing multi-line Python via nano paste.** See §13.
 - **Using regex patch scripts for one-line markdown edits.** See §13.
 - **Coordinating state across process boundaries via shared filesystem paths.** Phase 5.0 tried this for artifact content and it broke immediately. Put state that crosses a process boundary in the database. See §13.
+- **Inlining the heartbeat task into `execute_run`.** The separation between `_run_with_heartbeat` and `execute_run` is deliberate — keeps the §9 try/except topology untouched when the heartbeat story evolves.
+- **Running `npm run dev` on top of `evergreen restart`.** The CLI already starts the web server on :3015. Double-starting produces `EADDRINUSE`. Either attach with `evergreen attach` or `evergreen stop` first.
 
 ---
 
 ## 18. Local dev quickstart
 
-Cold start on framerbox395 from a reboot:
+Cold start on framerbox395 from a reboot, the easy way:
 
-    # 1. DB
-    systemctl status postgresql      # confirm running
+    # 1. DB container
+    docker start evergreen-command-db          # if not already running
+    docker exec -i evergreen-command-db psql -U command -d evergreen_command -c "SELECT 1;"
 
-    # 2. LLM
-    run-agent &                      # starts llama.cpp on :8081
-    curl -s http://127.0.0.1:8081/v1/models | jq .   # sanity check
+    # 2. Full stack via the CLI
+    evergreen restart                           # web :3015, worker, llama.cpp :8081
+    evergreen status                            # sanity check
 
-    # 3. Worker
+    # 3. (Optional) attach to multiplexed logs
+    evergreen attach                            # detach: Ctrl-b d
+
+Browse to http://127.0.0.1:3015 and sign in. Kick a run from the UI or via curl (§0) — for headless curl you'll need the `ev-session` cookie or the psql-insert bypass (§7).
+
+Manual cold start (without the CLI):
+
+    # DB
+    docker start evergreen-command-db
+
+    # LLM
+    run-agent &                                 # llama.cpp on :8081
+
+    # Worker
     cd /home/lynf/evergreen-command-claw
-    run-worker &                     # claims pending runs
+    run-worker &
 
-    # 4. Web
-    npm run dev                      # :3000
-
-Browse to http://127.0.0.1:3000. Kick a run from the UI or via curl (§0).
+    # Web
+    npm run dev                                 # :3015
 
 Shutdown (clean):
 
+    evergreen stop
+    # or manually:
     pkill -f "worker/main.py"
     pkill -f "llama-server"
     # Ctrl-C the npm dev process
@@ -632,6 +794,12 @@ Shutdown (clean):
 ## 19. Debugging journal
 
 Persistent notes from past incidents. Newest on top.
+
+**2026-04-13 — Phase 5.3 smoke-test session surfaced three pieces of doc drift**
+Folded into PR #4 alongside the 5.3 shipment. During Tests F and G, hit (1) `curl` against `:3000` returning `{"detail":"Method Not Allowed"}` from some other FastAPI process — real port is `:3015` (set in `package.json`); (2) `psql -U evergreen` missing because Postgres lives in Docker as `evergreen-command-db` with user `command`; (3) `curl -iX POST http://127.0.0.1:3015/api/runs` returning `HTTP/1.1 307 Temporary Redirect / location: /login` — the `middleware.ts` `ev-session` cookie gate was undocumented. Added §7 "Auth middleware" documenting public paths and the psql-direct-insert bypass, added §11 "evergreen CLI" block, fixed port references in §0 §1 §12 §18, and fixed the psql command in §0. Test G passed after using the psql bypass: run `70c90a2b-…` showed `running | last_heartbeat populated | age 3.5s` with heartbeat advancing. Test F passed earlier in the session: run `d498f02c-…` (stuck from the asyncpg-bind crash during initial 5.3 testing) was swept on next worker startup with the exact expected error_message.
+
+**2026-04-13 — Phase 5.3 shipped, heartbeat + startup sweep**
+Added `runs.last_heartbeat` + partial index via migration `0002_phase_5_3_heartbeat.sql`. `claim_next_run` now stamps the column on claim; a new `_heartbeat_loop` in `worker/main.py` bumps it every 10s while a run is active; a new `sweep_stale_runs` runs once on worker startup to flip any `running` row older than 120s to `failed`. Chose to wrap the heartbeat task *around* `execute_run` via `_run_with_heartbeat` rather than inside — preserves the §9 try/except topology. Heartbeat failures are swallowed with a log line so a transient Postgres hiccup can't kill a running agent. Startup sweep failures are also swallowed so a sweep bug can't block new work. First attempt at `sweep_stale_runs` used `$1::text` + `($1 || ' seconds')::interval` and hit asyncpg `DataError: expected str, got float` — fixed by binding the threshold as a numeric and using `now() - ($1 * interval '1 second')` instead, with the error_message formatted in Python and passed as a second param. Smoke tests F + G (§12) documented and passing. Known limitation: single-worker sweep only — a live worker cleaning up after another live worker is a Phase 6.0 concern once the second worker node exists.
 
 **2026-04-11 — Phase 5.0.1 shipped, first smoke test caught a stale-import trap**
 Phase 5.0 shipped with a content endpoint 500 because the web app and the worker disagreed about where `worker/artifacts/*.md` lived on disk. Fix: added `content TEXT` and `content_size INTEGER` columns to the `artifacts` table, taught `insert_artifact` + `write_brief` to populate them, rewrote the content route to `SELECT content FROM artifacts WHERE id = $1` with a legacy file fallback only for rows where `content IS NULL`. First smoke test after rollout still returned NULL content — root cause was `evergreen restart` having been run before `git checkout phase-5.0.1-artifacts-in-db`, so the worker's Python modules were cached from the old code. Second restart picked up the fix cleanly. New artifact row: `content_size=148`, `LENGTH(content)=148`, content endpoint 200. Filed §13 gotcha "Filesystem state between processes is a liability" and §13 "Python imports are cached at process start."
