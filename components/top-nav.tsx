@@ -58,7 +58,15 @@ export function TopNav() {
           })}
         </div>
 
-        <div className="ml-auto">
+        <div className="ml-auto flex items-center gap-2">
+          <span
+            aria-hidden
+            className="hidden md:inline-flex items-center gap-1 rounded-md border border-border bg-secondary/40 px-2 py-1 text-[10px] text-muted-foreground font-mono"
+            title="Open command palette"
+          >
+            <kbd className="font-mono">⌘</kbd>
+            <kbd className="font-mono">K</kbd>
+          </span>
           <Button asChild size="sm" variant="outline" className="gap-1.5">
             <Link href="/runs/new">
               <Plus />

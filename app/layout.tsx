@@ -3,6 +3,7 @@ import "./globals.css";
 import { TopNav } from "@/components/top-nav";
 import { Toaster } from "@/components/ui/toaster";
 import { KeyboardShortcuts } from "@/components/keyboard-shortcuts";
+import { CommandPalette } from "@/components/command-palette";
 
 export const metadata: Metadata = {
   title: "Evergreen Command",
@@ -33,6 +34,7 @@ export default function RootLayout({
         <div id="main-content">{children}</div>
         <Toaster />
         <KeyboardShortcuts />
+        <CommandPalette />
       </body>
     </html>
   );
