@@ -2,15 +2,15 @@
 //
 // Client-side filter + search over the last 100 runs. The server still
 // does one cheap query (page.tsx), then hands a lean, serializable list
-// here. Status chips + prompt text search, both URL-synced so filters are
-// shareable and survive a reload.
+// here. Status chips + prompt text search + profile filter, all URL-synced
+// so filters are shareable and survive a reload.
 
 "use client";
 
 import { useMemo, useState, useEffect, useCallback } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
-import { ChevronRight, Search, X, Sparkles } from "lucide-react";
+import { ChevronRight, Search, X, Sparkles, User } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -26,6 +26,8 @@ export type RunListItem = {
   prompt: string;
   model: string | null;
   totalTokens: number | null;
+  profileId: string | null;
+  profileName: string | null;
 };
 
 const STATUS_CHIPS: { key: string; label: string }[] = [
@@ -36,6 +38,11 @@ const STATUS_CHIPS: { key: string; label: string }[] = [
   { key: "failed", label: "Failed" },
   { key: "cancelled", label: "Cancelled" },
 ];
+
+// Sentinel string for "no profile attached" — differentiated from "all
+// profiles" (which means don't filter on profile at all). A run with no
+// profile has profileId === null; we encode that as "__none__" in the URL.
+const PROFILE_NONE = "__none__";
 
 function useDebounced<T>(value: T, delayMs: number) {
   const [debounced, setDebounced] = useState(value);
@@ -52,10 +59,32 @@ export function RunsBrowser({ runs }: { runs: RunListItem[] }) {
 
   const initialStatus = searchParams.get("status") ?? "all";
   const initialQuery = searchParams.get("q") ?? "";
+  const initialProfile = searchParams.get("profile") ?? "all";
 
   const [status, setStatus] = useState<string>(initialStatus);
   const [query, setQuery] = useState<string>(initialQuery);
+  const [profile, setProfile] = useState<string>(initialProfile);
   const debouncedQuery = useDebounced(query, 150);
+
+  // Distinct profiles present in the current run set — powers the dropdown.
+  // Newest profile activity first so the one you just switched to floats up.
+  const profileOptions = useMemo(() => {
+    const seen = new Map<string, string>();
+    let sawNone = false;
+    for (const r of runs) {
+      if (r.profileId) {
+        if (!seen.has(r.profileId)) {
+          seen.set(r.profileId, r.profileName ?? "(unnamed profile)");
+        }
+      } else {
+        sawNone = true;
+      }
+    }
+    return {
+      list: Array.from(seen, ([id, name]) => ({ id, name })),
+      hasNone: sawNone,
+    };
+  }, [runs]);
 
   // Sync filter state → URL (shareable). Replace, not push, to avoid
   // polluting browser history with every keystroke.
@@ -65,19 +94,28 @@ export function RunsBrowser({ runs }: { runs: RunListItem[] }) {
     else params.delete("status");
     if (debouncedQuery.trim()) params.set("q", debouncedQuery.trim());
     else params.delete("q");
+    if (profile && profile !== "all") params.set("profile", profile);
+    else params.delete("profile");
     const qs = params.toString();
     router.replace(qs ? `/runs?${qs}` : "/runs", { scroll: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status, debouncedQuery]);
+  }, [status, debouncedQuery, profile]);
 
   const filtered = useMemo(() => {
     const q = debouncedQuery.trim().toLowerCase();
     return runs.filter((r) => {
       if (status !== "all" && r.status !== status) return false;
       if (q && !r.prompt.toLowerCase().includes(q)) return false;
+      if (profile !== "all") {
+        if (profile === PROFILE_NONE) {
+          if (r.profileId !== null) return false;
+        } else if (r.profileId !== profile) {
+          return false;
+        }
+      }
       return true;
     });
-  }, [runs, status, debouncedQuery]);
+  }, [runs, status, debouncedQuery, profile]);
 
   const counts = useMemo(() => {
     const acc: Record<string, number> = { all: runs.length };
@@ -88,9 +126,22 @@ export function RunsBrowser({ runs }: { runs: RunListItem[] }) {
   const clear = useCallback(() => {
     setStatus("all");
     setQuery("");
+    setProfile("all");
   }, []);
 
-  const anyFilter = status !== "all" || query.trim() !== "";
+  const anyFilter =
+    status !== "all" || query.trim() !== "" || profile !== "all";
+
+  const activeProfileLabel =
+    profile === "all"
+      ? null
+      : profile === PROFILE_NONE
+        ? "No profile"
+        : (profileOptions.list.find((p) => p.id === profile)?.name ??
+          "(unknown profile)");
+
+  const showProfileControl =
+    profileOptions.list.length > 0 || profileOptions.hasNone;
 
   return (
     <div className="space-y-4">
@@ -126,27 +177,74 @@ export function RunsBrowser({ runs }: { runs: RunListItem[] }) {
           })}
         </div>
 
-        <div className="relative w-full lg:w-72">
-          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
-          <Input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search prompts…"
-            className="pl-8 pr-8"
-            aria-label="Search prompts"
-          />
-          {query && (
-            <button
-              type="button"
-              onClick={() => setQuery("")}
-              aria-label="Clear search"
-              className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
+        <div className="flex flex-col sm:flex-row gap-2 w-full lg:w-auto">
+          {showProfileControl && (
+            <div className="relative">
+              <User className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
+              <select
+                value={profile}
+                onChange={(e) => setProfile(e.target.value)}
+                aria-label="Filter by profile"
+                className={cn(
+                  "h-9 rounded-md bg-background pl-8 pr-8 text-sm border border-input",
+                  "ring-offset-background focus-visible:outline-none focus-visible:ring-2",
+                  "focus-visible:ring-ring focus-visible:ring-offset-2",
+                  "appearance-none cursor-pointer min-w-[180px]",
+                  profile !== "all" && "border-primary/60"
+                )}
+              >
+                <option value="all">All profiles</option>
+                {profileOptions.hasNone && (
+                  <option value={PROFILE_NONE}>No profile</option>
+                )}
+                {profileOptions.list.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+              <ChevronRight className="absolute right-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 rotate-90 text-muted-foreground pointer-events-none" />
+            </div>
           )}
+
+          <div className="relative w-full lg:w-72">
+            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
+            <Input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search prompts…"
+              className="pl-8 pr-8"
+              aria-label="Search prompts"
+            />
+            {query && (
+              <button
+                type="button"
+                onClick={() => setQuery("")}
+                aria-label="Clear search"
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
         </div>
       </div>
+
+      {activeProfileLabel && (
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <Badge variant="muted" className="gap-1 font-normal">
+            <User className="h-3 w-3" />
+            {activeProfileLabel}
+          </Badge>
+          <button
+            type="button"
+            onClick={() => setProfile("all")}
+            className="text-muted-foreground hover:text-foreground underline underline-offset-2"
+          >
+            clear
+          </button>
+        </div>
+      )}
 
       {filtered.length === 0 ? (
         <Card className="p-10 text-center">
@@ -216,6 +314,21 @@ export function RunsBrowser({ runs }: { runs: RunListItem[] }) {
                       <span className="tabular-nums">
                         {run.totalTokens.toLocaleString()} tok
                       </span>
+                    )}
+                    {run.profileName && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setProfile(run.profileId!);
+                        }}
+                        className="inline-flex items-center gap-1 rounded-full bg-primary/10 text-primary px-1.5 py-0.5 hover:bg-primary/20"
+                        title={`Filter by ${run.profileName}`}
+                      >
+                        <User className="h-2.5 w-2.5" />
+                        {run.profileName}
+                      </button>
                     )}
                   </div>
                 </div>

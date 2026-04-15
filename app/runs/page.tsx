@@ -21,12 +21,30 @@ export default async function RunsPage() {
 
   // Trim to a serializable, client-friendly shape. Drizzle returns Date
   // objects + full jsonb blobs; we only need a preview string here.
+  // Phase 5.4.2: pull out the {id, name} profile breadcrumb that
+  // POST /api/runs stamps onto input.profile, so the client can filter by
+  // profile without a second query.
   const items: RunListItem[] = rows.map((r) => {
-    const input = (r.input ?? {}) as { prompt?: unknown };
+    const input = (r.input ?? {}) as {
+      prompt?: unknown;
+      profile?: unknown;
+    };
     const prompt =
       typeof input.prompt === "string" && input.prompt.length > 0
         ? input.prompt
         : "(no prompt)";
+    const profileBreadcrumb =
+      input.profile && typeof input.profile === "object"
+        ? (input.profile as { id?: unknown; name?: unknown })
+        : null;
+    const profileId =
+      profileBreadcrumb && typeof profileBreadcrumb.id === "string"
+        ? profileBreadcrumb.id
+        : null;
+    const profileName =
+      profileBreadcrumb && typeof profileBreadcrumb.name === "string"
+        ? profileBreadcrumb.name
+        : null;
     return {
       id: r.id,
       status: r.status,
@@ -37,6 +55,8 @@ export default async function RunsPage() {
       prompt,
       model: r.model ?? null,
       totalTokens: r.totalTokens ?? null,
+      profileId,
+      profileName,
     };
   });
 
@@ -51,7 +71,8 @@ export default async function RunsPage() {
             </Badge>
           </div>
           <p className="text-muted-foreground text-sm mt-1">
-            Every agent run, newest first. Filter by status or search prompts.
+            Every agent run, newest first. Filter by status, profile, or search
+            prompts.
           </p>
         </div>
         <Button asChild size="sm">
