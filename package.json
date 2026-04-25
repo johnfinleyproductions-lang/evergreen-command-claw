@@ -10,7 +10,8 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:push": "drizzle-kit push",
-    "db:studio": "drizzle-kit studio"
+    "db:studio": "drizzle-kit studio",
+    "db:seed:tier1": "tsx --env-file=.env.local lib/db/seed/tier1-tasks.ts"
   },
   "dependencies": {
     "@ai-sdk/openai": "^1.3.22",
@@ -43,6 +44,7 @@
     "drizzle-kit": "^0.31.1",
     "postcss": "^8.5.3",
     "tailwindcss": "^4.1.7",
+    "tsx": "^4.19.2",
     "typescript": "^5.8.3"
   }
 }
