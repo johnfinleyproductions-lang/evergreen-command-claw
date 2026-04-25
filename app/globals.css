@@ -1,6 +1,24 @@
 @import "tailwindcss";
+@plugin "tailwindcss-animate";
+
+/*
+ * Evergreen Command — unified theme tokens.
+ *
+ * We expose two parallel names for the same color so existing code keeps
+ * working while we migrate to shadcn naming:
+ *
+ *   --color-bg / --color-background          → bg-bg, bg-background
+ *   --color-surface / --color-card           → bg-surface, bg-card
+ *   --color-text / --color-foreground        → text-text, text-foreground
+ *   --color-text-muted / --color-muted-fg    → text-text-muted, text-muted-foreground
+ *   --color-border                           → border, border-border
+ *   --color-accent                           → accent / primary
+ *
+ * All values tuned for the dark agent-console aesthetic.
+ */
 
 @theme {
+  /* Legacy Evergreen names (keep working) */
   --color-bg: #0a0a0a;
   --color-surface: #141414;
   --color-surface-2: #1c1c1c;
@@ -8,28 +26,86 @@
   --color-border: #2a2a2a;
   --color-border-hover: #3a3a3a;
   --color-text: #e5e5e5;
-  --color-text-muted: #737373;
+  --color-text-muted: #a1a1aa;
   --color-text-dim: #525252;
   --color-accent: #22c55e;
   --color-accent-dim: #16a34a;
+
+  /* shadcn-compatible aliases */
+  --color-background: #0a0a0a;
+  --color-foreground: #e5e5e5;
+  --color-card: #141414;
+  --color-card-foreground: #e5e5e5;
+  --color-popover: #141414;
+  --color-popover-foreground: #e5e5e5;
+  --color-primary: #22c55e;
+  --color-primary-foreground: #0a0a0a;
+  --color-secondary: #1c1c1c;
+  --color-secondary-foreground: #e5e5e5;
+  --color-muted: #1c1c1c;
+  --color-muted-foreground: #a1a1aa;
+  --color-accent-foreground: #0a0a0a;
+  --color-destructive: #ef4444;
+  --color-destructive-foreground: #fafafa;
+  --color-input: #2a2a2a;
+  --color-ring: #22c55e;
+
+  /* Status palette — used by RunStatusBadge */
+  --color-status-pending: #a1a1aa;
+  --color-status-running: #3b82f6;
+  --color-status-succeeded: #22c55e;
+  --color-status-failed: #ef4444;
+  --color-status-cancelled: #f59e0b;
+
+  --radius: 0.5rem;
 }
 
-body {
-  background: var(--color-bg);
-  color: var(--color-text);
-  font-family: "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+/* Border defaults — shadcn components use `border` with no color */
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+
+  body {
+    background: var(--color-bg);
+    color: var(--color-text);
+    font-family: "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  /* Monospace tightening */
+  pre, code, kbd, samp {
+    font-family: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular,
+      Menlo, Monaco, Consolas, monospace;
+  }
+
+  /* Selection */
+  ::selection {
+    background: rgba(34, 197, 94, 0.25);
+    color: var(--color-text);
+  }
 }
 
+/* Scrollbars — match the surface palette */
 ::-webkit-scrollbar {
-  width: 6px;
+  width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
   background: var(--color-border-hover);
-  border-radius: 3px;
+  border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
   background: var(--color-text-dim);
+}
+
+/* Focus ring helper — used by shadcn primitives */
+@layer utilities {
+  .focus-ring {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--color-bg), 0 0 0 4px var(--color-ring);
+  }
 }

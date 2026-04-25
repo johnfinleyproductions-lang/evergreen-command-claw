@@ -1,10 +1,14 @@
 // app/runs/page.tsx
 
+import { Suspense } from "react";
 import Link from "next/link";
 import { desc } from "drizzle-orm";
+import { Plus } from "lucide-react";
 import { db } from "@/lib/db/client";
 import { runs } from "@/lib/db/schema/runs";
-import { RunRow } from "./run-row";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { RunsBrowser, type RunListItem } from "./runs-browser";
 
 export const dynamic = "force-dynamic";
 
@@ -15,34 +19,73 @@ export default async function RunsPage() {
     .orderBy(desc(runs.createdAt))
     .limit(100);
 
+  // Trim to a serializable, client-friendly shape. Drizzle returns Date
+  // objects + full jsonb blobs; we only need a preview string here.
+  // Phase 5.4.2: pull out the {id, name} profile breadcrumb that
+  // POST /api/runs stamps onto input.profile, so the client can filter by
+  // profile without a second query.
+  const items: RunListItem[] = rows.map((r) => {
+    const input = (r.input ?? {}) as {
+      prompt?: unknown;
+      profile?: unknown;
+    };
+    const prompt =
+      typeof input.prompt === "string" && input.prompt.length > 0
+        ? input.prompt
+        : "(no prompt)";
+    const profileBreadcrumb =
+      input.profile && typeof input.profile === "object"
+        ? (input.profile as { id?: unknown; name?: unknown })
+        : null;
+    const profileId =
+      profileBreadcrumb && typeof profileBreadcrumb.id === "string"
+        ? profileBreadcrumb.id
+        : null;
+    const profileName =
+      profileBreadcrumb && typeof profileBreadcrumb.name === "string"
+        ? profileBreadcrumb.name
+        : null;
+    return {
+      id: r.id,
+      status: r.status,
+      createdAt:
+        r.createdAt instanceof Date
+          ? r.createdAt.toISOString()
+          : String(r.createdAt),
+      prompt,
+      model: r.model ?? null,
+      totalTokens: r.totalTokens ?? null,
+      profileId,
+      profileName,
+    };
+  });
+
   return (
-    <main className="mx-auto max-w-5xl px-6 py-10">
-      <header className="flex items-center justify-between mb-6">
+    <main className="mx-auto max-w-7xl px-6 py-10">
+      <header className="flex flex-col md:flex-row md:items-end md:justify-between gap-3 mb-6">
         <div>
-          <h1 className="text-2xl font-semibold text-text">All Runs</h1>
-          <p className="text-text-muted text-sm mt-1">
-            {rows.length === 100 ? "showing last 100" : `${rows.length} total`}
+          <div className="flex items-center gap-3">
+            <h1 className="text-2xl font-semibold tracking-tight">All runs</h1>
+            <Badge variant="muted" className="font-mono">
+              {rows.length === 100 ? "last 100" : `${rows.length} total`}
+            </Badge>
+          </div>
+          <p className="text-muted-foreground text-sm mt-1">
+            Every agent run, newest first. Filter by status, profile, or search
+            prompts.
           </p>
         </div>
-        <Link
-          href="/runs/new"
-          className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-md text-white font-medium transition-colors"
-        >
-          + New Run
-        </Link>
+        <Button asChild size="sm">
+          <Link href="/runs/new">
+            <Plus />
+            New run
+          </Link>
+        </Button>
       </header>
 
-      {rows.length === 0 ? (
-        <div className="rounded-lg border border-gray-800 bg-surface/50 p-8 text-center">
-          <p className="text-text-muted">No runs yet.</p>
-        </div>
-      ) : (
-        <div className="rounded-lg border border-gray-800 bg-surface/50 divide-y divide-gray-800 overflow-hidden">
-          {rows.map((run) => (
-            <RunRow key={run.id} run={run} />
-          ))}
-        </div>
-      )}
+      <Suspense fallback={null}>
+        <RunsBrowser runs={items} />
+      </Suspense>
     </main>
   );
 }
